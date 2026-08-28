@@ -27,6 +27,9 @@ jobs:
       - name: Update current B3 prices
         run: python update_prices.py
 
+      - name: Repair current B3 prices
+        run: python repair_prices.py
+
       - name: Update current B3 fundamentals
         run: python update_fundamentals.py
 
