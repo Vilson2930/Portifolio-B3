@@ -30,6 +30,9 @@ jobs:
       - name: Update current B3 fundamentals
         run: python update_fundamentals.py
 
+      - name: Update current B3 sectors
+        run: python update_sectors.py
+
       - name: Upload historical reports
         if: always()
         uses: actions/upload-artifact@v4
