@@ -73,7 +73,7 @@ def load_csv(
     """
     Carrega um CSV obrigatório.
 
-    A execução é interrompida se:
+    Interrompe a execução se:
         - o arquivo não existir;
         - o arquivo estiver vazio.
     """
@@ -100,8 +100,8 @@ def load_csv(
 
 def load_inputs():
     """
-    Carrega os três inputs necessários para a
-    seleção da carteira.
+    Carrega os três inputs necessários para
+    reproduzir a seleção da carteira.
     """
 
     sector_rankings = load_csv(
@@ -127,7 +127,7 @@ def load_inputs():
 
 
 # ============================================================
-# IMPRESSÃO DA CONFIGURAÇÃO
+# IMPRESSÃO DA METODOLOGIA
 # ============================================================
 
 def print_methodology() -> None:
@@ -204,19 +204,76 @@ def print_inputs(
 
 
 # ============================================================
+# PERÍODO COMUM REPRODUZÍVEL
+# ============================================================
+
+def get_common_years(
+    fundamentals: pd.DataFrame,
+    prices: pd.DataFrame,
+) -> list[int]:
+    """
+    Determina os anos em que fundamentos e fatores de preço
+    existem simultaneamente.
+
+    Esse é o período efetivamente reproduzível da metodologia
+    final de seleção das ações.
+    """
+
+    fund_years = set(
+        pd.to_numeric(
+            fundamentals["YEAR"],
+            errors="coerce",
+        )
+        .dropna()
+        .astype(int)
+        .unique()
+    )
+
+    price_years = set(
+        pd.to_numeric(
+            prices["YEAR"],
+            errors="coerce",
+        )
+        .dropna()
+        .astype(int)
+        .unique()
+    )
+
+    common_years = sorted(
+        fund_years & price_years
+    )
+
+    if not common_years:
+        raise ValueError(
+            "Nenhum ano comum entre fundamentos e fatores de preço."
+        )
+
+    return common_years
+
+
+# ============================================================
 # IMPRESSÃO DOS SETORES
 # ============================================================
 
 def print_selected_sectors(
     sectors: pd.DataFrame,
+    valid_years: list[int],
 ) -> None:
+    """
+    Mostra somente os setores pertencentes ao período
+    efetivamente reproduzido.
+    """
+
+    display_df = sectors[
+        sectors["YEAR"].isin(valid_years)
+    ].copy()
 
     print()
     print("=" * 78)
     print("SETORES SELECIONADOS — TOP4_1Y")
     print("=" * 78)
 
-    for year, year_df in sectors.groupby(
+    for year, year_df in display_df.groupby(
         "YEAR",
         sort=True,
     ):
@@ -308,33 +365,70 @@ def print_audit(
     sectors: pd.DataFrame,
     result: pd.DataFrame,
 ) -> None:
+    """
+    Audita apenas o período efetivamente reproduzido.
 
-    years_sectors = set(
-        sectors["YEAR"].unique()
-    )
+    A C17 possui rankings desde 2019.
+    A metodologia final das ações possui fatores utilizáveis
+    a partir de 2021.
 
-    years_portfolio = set(
-        result["YEAR"].unique()
-    )
+    Portanto:
+        rankings anteriores podem existir;
+        toda carteira reproduzida precisa possuir ranking;
+        não exigimos que todo ano do ranking possua carteira.
+    """
 
-    if years_sectors != years_portfolio:
+    if result.empty:
         raise ValueError(
-            "AUDITORIA FAIL — anos dos rankings setoriais "
-            "não coincidem com os anos das carteiras."
+            "AUDITORIA FAIL — nenhuma carteira reproduzida."
         )
 
-    for year in sorted(
-        years_portfolio
-    ):
+    years_portfolio = sorted(
+        result["YEAR"]
+        .dropna()
+        .astype(int)
+        .unique()
+    )
+
+    years_sectors = set(
+        sectors["YEAR"]
+        .dropna()
+        .astype(int)
+        .unique()
+    )
+
+    # --------------------------------------------------------
+    # Todo ano reproduzido precisa existir no ranking setorial.
+    # --------------------------------------------------------
+
+    missing_sector_years = [
+        year
+        for year in years_portfolio
+        if year not in years_sectors
+    ]
+
+    if missing_sector_years:
+        raise ValueError(
+            "AUDITORIA FAIL — anos da carteira sem "
+            "ranking setorial correspondente: "
+            f"{missing_sector_years}"
+        )
+
+    # --------------------------------------------------------
+    # Auditoria ano a ano
+    # --------------------------------------------------------
+
+    for year in years_portfolio:
 
         year_sectors = sectors[
             sectors["YEAR"] == year
-        ]
+        ].copy()
 
         year_portfolio = result[
             result["YEAR"] == year
-        ]
+        ].copy()
 
+        # 4 setores selecionados
         if (
             year_sectors["MACRO_SECTOR"]
             .nunique()
@@ -342,14 +436,70 @@ def print_audit(
         ):
             raise ValueError(
                 f"AUDITORIA FAIL — {year}: "
-                "quantidade incorreta de setores."
+                f"quantidade de setores TOP4_1Y diferente de "
+                f"{N_SECTORS}."
             )
 
+        # 12 ações totais
         if len(year_portfolio) != TOTAL_STOCKS:
             raise ValueError(
                 f"AUDITORIA FAIL — {year}: "
-                f"{len(year_portfolio)} ações; "
+                f"{len(year_portfolio)} ações encontradas; "
                 f"esperadas {TOTAL_STOCKS}."
+            )
+
+        # 4 setores na carteira final
+        portfolio_sector_count = (
+            year_portfolio[
+                "MACRO_SECTOR"
+            ]
+            .nunique()
+        )
+
+        if portfolio_sector_count != N_SECTORS:
+            raise ValueError(
+                f"AUDITORIA FAIL — {year}: "
+                f"{portfolio_sector_count} setores na carteira; "
+                f"esperados {N_SECTORS}."
+            )
+
+        # 3 ações em cada setor
+        counts = (
+            year_portfolio
+            .groupby("MACRO_SECTOR")
+            .size()
+        )
+
+        invalid_counts = counts[
+            counts != STOCKS_PER_SECTOR
+        ]
+
+        if not invalid_counts.empty:
+            raise ValueError(
+                f"AUDITORIA FAIL — {year}: "
+                "quantidade incorreta de ações por setor. "
+                f"{counts.to_dict()}"
+            )
+
+        # Setores da carteira precisam ser exatamente
+        # os setores TOP4_1Y daquele ano.
+        expected_sectors = set(
+            year_sectors[
+                "MACRO_SECTOR"
+            ]
+        )
+
+        actual_sectors = set(
+            year_portfolio[
+                "MACRO_SECTOR"
+            ]
+        )
+
+        if actual_sectors != expected_sectors:
+            raise ValueError(
+                f"AUDITORIA FAIL — {year}: "
+                "setores da carteira não correspondem "
+                "aos setores TOP4_1Y."
             )
 
     print()
@@ -358,11 +508,20 @@ def print_audit(
     print("=" * 78)
 
     print(
+        f"Período reproduzido ................... "
+        f"{min(years_portfolio)}–{max(years_portfolio)}"
+    )
+
+    print(
         "TOP4_1Y dinâmico ..................... PASS"
     )
 
     print(
         "Ausência de look-ahead setorial ...... PASS"
+    )
+
+    print(
+        "Período comum dos fatores ............ PASS"
     )
 
     print(
@@ -375,6 +534,10 @@ def print_audit(
 
     print(
         f"{TOTAL_STOCKS} ações por carteira ................... PASS"
+    )
+
+    print(
+        "Setores carteira = TOP4_1Y ........... PASS"
     )
 
     print(
@@ -411,10 +574,22 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 3. Reproduzir TOP4_1Y
-    #
-    # Aqui os setores são CALCULADOS.
-    # Não são lidos de uma lista fixa.
+    # 3. Período comum dos fatores
+    # --------------------------------------------------------
+
+    common_years = get_common_years(
+        fundamentals,
+        prices,
+    )
+
+    print()
+    print(
+        f"Período comum      : "
+        f"{min(common_years)}–{max(common_years)}"
+    )
+
+    # --------------------------------------------------------
+    # 4. Reproduzir TOP4_1Y
     # --------------------------------------------------------
 
     selected_sectors = select_top4_1y(
@@ -422,21 +597,12 @@ def main():
     )
 
     print_selected_sectors(
-        selected_sectors
+        selected_sectors,
+        common_years,
     )
 
     # --------------------------------------------------------
-    # 4. Executar seleção completa
-    #
-    # TOP4_1Y
-    #       ↓
-    # 4 setores
-    #       ↓
-    # 80% Discount + 20% Fundamentals
-    #       ↓
-    # Top 3 por setor
-    #       ↓
-    # 12 ações
+    # 5. Executar seleção completa
     # --------------------------------------------------------
 
     result = run_portfolio_selection(
@@ -446,7 +612,20 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 5. Mostrar carteiras
+    # 6. Manter somente período comum
+    # --------------------------------------------------------
+
+    result = result[
+        result["YEAR"].isin(common_years)
+    ].copy()
+
+    if result.empty:
+        raise ValueError(
+            "Nenhuma carteira permaneceu no período comum."
+        )
+
+    # --------------------------------------------------------
+    # 7. Mostrar carteiras
     # --------------------------------------------------------
 
     print_portfolios(
@@ -454,7 +633,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 6. Auditoria
+    # 8. Auditoria
     # --------------------------------------------------------
 
     print_audit(
@@ -463,7 +642,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 7. Gerar relatórios
+    # 9. Relatórios
     # --------------------------------------------------------
 
     REPORTS.mkdir(
@@ -477,14 +656,30 @@ def main():
         encoding="utf-8-sig",
     )
 
-    selected_sectors.to_csv(
+    selected_sectors_report = (
+        selected_sectors[
+            selected_sectors[
+                "YEAR"
+            ].isin(common_years)
+        ]
+        .copy()
+        .sort_values(
+            [
+                "YEAR",
+                "SECTOR_RANK",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    selected_sectors_report.to_csv(
         SECTOR_REPORT_FILE,
         index=False,
         encoding="utf-8-sig",
     )
 
     # --------------------------------------------------------
-    # 8. Final
+    # 10. Final
     # --------------------------------------------------------
 
     print()
