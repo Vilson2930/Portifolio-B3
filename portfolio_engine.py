@@ -1,6 +1,6 @@
 """
 PORTIFOLIO-B3
-Motor da metodologia congelada no estudo.
+Motor de reprodução da metodologia congelada no estudo.
 
 Arquitetura:
     4 setores x 3 ações = 12 ações
@@ -26,21 +26,13 @@ import pandas as pd
 
 N_SECTORS = 4
 STOCKS_PER_SECTOR = 3
+TOTAL_STOCKS = N_SECTORS * STOCKS_PER_SECTOR
 
 DISCOUNT_WEIGHT = 0.80
 FUNDAMENTAL_WEIGHT = 0.20
 
 SECTOR_RULE = "TOP4_1Y"
 STOCK_RULE = "DISCOUNT_80_FUNDAMENTALS_20"
-
-
-# Componentes utilizados no FUND_SCORE
-FUNDAMENTAL_COMPONENTS = [
-    "ROE_W",
-    "ROA_W",
-    "OPERATING_MARGIN_W",
-    "NET_MARGIN_W",
-]
 
 MIN_FUNDAMENTAL_COMPONENTS = 3
 
@@ -58,7 +50,11 @@ def require_columns(
     Interrompe a execução se alguma coluna obrigatória estiver ausente.
     """
 
-    missing = [col for col in columns if col not in df.columns]
+    missing = [
+        col
+        for col in columns
+        if col not in df.columns
+    ]
 
     if missing:
         raise ValueError(
@@ -75,7 +71,7 @@ def percentile_rank(
     column: str,
 ) -> pd.Series:
     """
-    Calcula percentile rank exatamente dentro de:
+    Calcula percentile rank dentro de:
 
         YEAR × MACRO_SECTOR
 
@@ -92,6 +88,241 @@ def percentile_rank(
             method="average",
         )
     )
+
+
+# ============================================================
+# SELEÇÃO DINÂMICA DOS 4 SETORES — TOP4_1Y
+# ============================================================
+
+def select_top4_1y(
+    sector_rankings: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Reproduz a regra setorial congelada na Célula 24.
+
+    A REGRA é congelada.
+    Os NOMES dos setores não são congelados.
+
+    Para cada YEAR:
+
+        1. utiliza somente LOOKBACK == 1;
+        2. verifica ausência de look-ahead;
+        3. ordena por RANK crescente;
+        4. usa MACRO_SECTOR como desempate;
+        5. seleciona os quatro primeiros setores.
+    """
+
+    required = [
+        "LOOKBACK",
+        "YEAR",
+        "MACRO_SECTOR",
+        "RANK_METRIC",
+        "HISTORY_START",
+        "HISTORY_END",
+        "RANK",
+    ]
+
+    require_columns(
+        sector_rankings,
+        required,
+        "sector_rankings",
+    )
+
+    df = sector_rankings.copy()
+
+    # --------------------------------------------------------
+    # Conversões
+    # --------------------------------------------------------
+
+    for col in [
+        "LOOKBACK",
+        "YEAR",
+        "RANK",
+        "HISTORY_START",
+        "HISTORY_END",
+    ]:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
+
+    df["MACRO_SECTOR"] = (
+        df["MACRO_SECTOR"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    # --------------------------------------------------------
+    # Linhas válidas
+    # --------------------------------------------------------
+
+    df = df[
+        df["LOOKBACK"].notna()
+        & df["YEAR"].notna()
+        & df["RANK"].notna()
+    ].copy()
+
+    df["LOOKBACK"] = (
+        df["LOOKBACK"]
+        .astype(int)
+    )
+
+    df["YEAR"] = (
+        df["YEAR"]
+        .astype(int)
+    )
+
+    df["RANK"] = (
+        df["RANK"]
+        .astype(int)
+    )
+
+    # --------------------------------------------------------
+    # AUDITORIA — LOOK-AHEAD
+    #
+    # Célula 24:
+    #
+    # HISTORY_END < YEAR
+    # --------------------------------------------------------
+
+    lookahead_fail = df[
+        df["HISTORY_END"].notna()
+        & (
+            df["HISTORY_END"]
+            >= df["YEAR"]
+        )
+    ]
+
+    if not lookahead_fail.empty:
+        raise ValueError(
+            "TOP4_1Y — look-ahead detectado em "
+            f"{len(lookahead_fail)} linhas."
+        )
+
+    # --------------------------------------------------------
+    # AUDITORIA — DUPLICIDADES
+    #
+    # Uma observação por:
+    #
+    # LOOKBACK × YEAR × MACRO_SECTOR
+    # --------------------------------------------------------
+
+    duplicated = df.duplicated(
+        [
+            "LOOKBACK",
+            "YEAR",
+            "MACRO_SECTOR",
+        ]
+    )
+
+    if duplicated.any():
+        raise ValueError(
+            "TOP4_1Y — duplicidades encontradas em "
+            "LOOKBACK × YEAR × MACRO_SECTOR."
+        )
+
+    # --------------------------------------------------------
+    # REGRA VENCEDORA
+    #
+    # TOP4_1Y
+    # --------------------------------------------------------
+
+    one_year = df[
+        df["LOOKBACK"] == 1
+    ].copy()
+
+    if one_year.empty:
+        raise ValueError(
+            "TOP4_1Y — nenhuma observação com LOOKBACK = 1."
+        )
+
+    selected_rows = []
+
+    # --------------------------------------------------------
+    # TOP 4 SETORES DE CADA ANO
+    # --------------------------------------------------------
+
+    for year, group in one_year.groupby(
+        "YEAR",
+        sort=True,
+    ):
+
+        group = (
+            group
+            .sort_values(
+                [
+                    "RANK",
+                    "MACRO_SECTOR",
+                ],
+                ascending=[
+                    True,
+                    True,
+                ],
+            )
+            .reset_index(drop=True)
+        )
+
+        selected = (
+            group
+            .head(N_SECTORS)
+            .copy()
+        )
+
+        if len(selected) != N_SECTORS:
+            raise ValueError(
+                f"TOP4_1Y — {year}: "
+                f"{len(selected)} setores disponíveis; "
+                f"esperados {N_SECTORS}."
+            )
+
+        selected["SECTOR_RANK"] = range(
+            1,
+            N_SECTORS + 1,
+        )
+
+        selected_rows.append(
+            selected[
+                [
+                    "YEAR",
+                    "SECTOR_RANK",
+                    "MACRO_SECTOR",
+                    "RANK",
+                    "RANK_METRIC",
+                    "HISTORY_START",
+                    "HISTORY_END",
+                ]
+            ]
+        )
+
+    result = pd.concat(
+        selected_rows,
+        ignore_index=True,
+    )
+
+    # --------------------------------------------------------
+    # AUDITORIA DA ARQUITETURA SETORIAL
+    # --------------------------------------------------------
+
+    sector_counts = (
+        result
+        .groupby("YEAR")
+        ["MACRO_SECTOR"]
+        .nunique()
+    )
+
+    invalid = sector_counts[
+        sector_counts != N_SECTORS
+    ]
+
+    if not invalid.empty:
+        raise ValueError(
+            "TOP4_1Y — falha estrutural: "
+            "nem todos os anos possuem exatamente "
+            f"{N_SECTORS} setores."
+        )
+
+    return result
 
 
 # ============================================================
@@ -112,13 +343,15 @@ def build_fundamental_score(
         Net Margin
         Qualidade de alavancagem
 
-    A qualidade de alavancagem é baseada no inverso do
-    Debt-to-Equity Proxy.
+    A qualidade de alavancagem utiliza:
 
-    O componente de dívida somente é considerado quando
-    EQUITY > 0.
+        -DEBT_TO_EQUITY_PROXY_W
 
-    FUND_SCORE exige pelo menos 3 componentes válidos.
+    somente quando:
+
+        EQUITY > 0
+
+    FUND_SCORE exige pelo menos três componentes válidos.
     """
 
     required = [
@@ -142,11 +375,50 @@ def build_fundamental_score(
     df = fundamentals.copy()
 
     # --------------------------------------------------------
+    # Padronização das chaves
+    # --------------------------------------------------------
+
+    df["YEAR"] = pd.to_numeric(
+        df["YEAR"],
+        errors="coerce",
+    )
+
+    df = df[
+        df["YEAR"].notna()
+    ].copy()
+
+    df["YEAR"] = (
+        df["YEAR"]
+        .astype(int)
+    )
+
+    df["TICKER"] = (
+        df["TICKER"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df["MACRO_SECTOR"] = (
+        df["MACRO_SECTOR"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    # --------------------------------------------------------
     # Percentis dos fundamentos
     # --------------------------------------------------------
 
-    df["ROE_SCORE"] = percentile_rank(df, "ROE_W")
-    df["ROA_SCORE"] = percentile_rank(df, "ROA_W")
+    df["ROE_SCORE"] = percentile_rank(
+        df,
+        "ROE_W",
+    )
+
+    df["ROA_SCORE"] = percentile_rank(
+        df,
+        "ROA_W",
+    )
 
     df["OPERATING_MARGIN_SCORE"] = percentile_rank(
         df,
@@ -159,32 +431,32 @@ def build_fundamental_score(
     )
 
     # --------------------------------------------------------
-    # Qualidade da alavancagem
+    # Qualidade de alavancagem
     #
-    # Menor dívida / patrimônio = melhor.
-    #
-    # No estudo:
-    #   leverage_quality = -DEBT_TO_EQUITY_PROXY_W
-    #
-    # Apenas patrimônio positivo é considerado.
+    # Menor dívida/patrimônio = melhor.
     # --------------------------------------------------------
 
-    df["LEVERAGE_QUALITY"] = pd.NA
+    df["LEVERAGE_QUALITY"] = float("nan")
 
-    positive_equity = df["EQUITY"] > 0
+    positive_equity = (
+        pd.to_numeric(
+            df["EQUITY"],
+            errors="coerce",
+        )
+        > 0
+    )
+
+    debt_equity = pd.to_numeric(
+        df["DEBT_TO_EQUITY_PROXY_W"],
+        errors="coerce",
+    )
 
     df.loc[
         positive_equity,
         "LEVERAGE_QUALITY",
-    ] = -df.loc[
-        positive_equity,
-        "DEBT_TO_EQUITY_PROXY_W",
+    ] = -debt_equity.loc[
+        positive_equity
     ]
-
-    df["LEVERAGE_QUALITY"] = pd.to_numeric(
-        df["LEVERAGE_QUALITY"],
-        errors="coerce",
-    )
 
     df["LEVERAGE_SCORE"] = percentile_rank(
         df,
@@ -221,12 +493,7 @@ def build_fundamental_score(
         df["FUND_COMPONENTS_VALID"]
         < MIN_FUNDAMENTAL_COMPONENTS,
         "FUND_SCORE",
-    ] = pd.NA
-
-    df["FUND_SCORE"] = pd.to_numeric(
-        df["FUND_SCORE"],
-        errors="coerce",
-    )
+    ] = float("nan")
 
     return df
 
@@ -241,7 +508,7 @@ def build_discount_score(
     """
     Constrói o DISCOUNT_SCORE.
 
-    DISCOUNT_52W já vem da metodologia da Célula 26:
+    O DISCOUNT_52W é produzido pela metodologia da Célula 26:
 
         DRAWDOWN_52W =
             PRICE_T0 / MAX_PRICE_52W - 1
@@ -249,8 +516,9 @@ def build_discount_score(
         DISCOUNT_52W =
             max(0, -DRAWDOWN_52W)
 
-    Aqui apenas transformamos o fator em percentile rank
-    dentro de YEAR × MACRO_SECTOR.
+    Aqui é calculado o percentile rank dentro de:
+
+        YEAR × MACRO_SECTOR
     """
 
     required = [
@@ -268,6 +536,39 @@ def build_discount_score(
 
     df = price_factors.copy()
 
+    df["YEAR"] = pd.to_numeric(
+        df["YEAR"],
+        errors="coerce",
+    )
+
+    df = df[
+        df["YEAR"].notna()
+    ].copy()
+
+    df["YEAR"] = (
+        df["YEAR"]
+        .astype(int)
+    )
+
+    df["TICKER"] = (
+        df["TICKER"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df["MACRO_SECTOR"] = (
+        df["MACRO_SECTOR"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df["DISCOUNT_52W"] = pd.to_numeric(
+        df["DISCOUNT_52W"],
+        errors="coerce",
+    )
+
     df["DISCOUNT_SCORE"] = percentile_rank(
         df,
         "DISCOUNT_52W",
@@ -277,7 +578,7 @@ def build_discount_score(
 
 
 # ============================================================
-# SCORE FINAL
+# SCORE FINAL DAS AÇÕES
 # ============================================================
 
 def build_final_scores(
@@ -285,7 +586,9 @@ def build_final_scores(
     price_factors: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Junta fundamentos e preço e aplica a regra vencedora:
+    Junta fundamentos e fatores de preço.
+
+    Regra vencedora congelada:
 
         FINAL_SCORE =
             0.80 × DISCOUNT_SCORE
@@ -293,14 +596,35 @@ def build_final_scores(
             0.20 × FUND_SCORE
     """
 
-    fund = build_fundamental_score(fundamentals)
-    price = build_discount_score(price_factors)
+    fund = build_fundamental_score(
+        fundamentals
+    )
+
+    price = build_discount_score(
+        price_factors
+    )
 
     keys = [
         "YEAR",
         "TICKER",
         "MACRO_SECTOR",
     ]
+
+    # --------------------------------------------------------
+    # Auditoria de unicidade antes do merge
+    # --------------------------------------------------------
+
+    if fund.duplicated(keys).any():
+        raise ValueError(
+            "fundamental_factors possui duplicidades em "
+            "YEAR × TICKER × MACRO_SECTOR."
+        )
+
+    if price.duplicated(keys).any():
+        raise ValueError(
+            "price_factors possui duplicidades em "
+            "YEAR × TICKER × MACRO_SECTOR."
+        )
 
     price_keep = keys + [
         "DISCOUNT_52W",
@@ -314,13 +638,79 @@ def build_final_scores(
         validate="one_to_one",
     )
 
+    if df.empty:
+        raise ValueError(
+            "Merge fundamentos × preço resultou em base vazia."
+        )
+
     df["FINAL_SCORE"] = (
-        DISCOUNT_WEIGHT * df["DISCOUNT_SCORE"]
+        DISCOUNT_WEIGHT
+        * df["DISCOUNT_SCORE"]
         +
-        FUNDAMENTAL_WEIGHT * df["FUND_SCORE"]
+        FUNDAMENTAL_WEIGHT
+        * df["FUND_SCORE"]
     )
 
     return df
+
+
+# ============================================================
+# APLICAR OS SETORES TOP4_1Y
+# ============================================================
+
+def apply_selected_sectors(
+    scores: pd.DataFrame,
+    selected_sectors: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Mantém somente as ações pertencentes aos quatro setores
+    escolhidos dinamicamente pelo TOP4_1Y em cada YEAR.
+    """
+
+    required = [
+        "YEAR",
+        "SECTOR_RANK",
+        "MACRO_SECTOR",
+    ]
+
+    require_columns(
+        selected_sectors,
+        required,
+        "selected_sectors",
+    )
+
+    sector_keys = selected_sectors[
+        [
+            "YEAR",
+            "SECTOR_RANK",
+            "MACRO_SECTOR",
+        ]
+    ].copy()
+
+    if sector_keys.duplicated(
+        ["YEAR", "MACRO_SECTOR"]
+    ).any():
+        raise ValueError(
+            "Seleção setorial possui duplicidades em "
+            "YEAR × MACRO_SECTOR."
+        )
+
+    filtered = scores.merge(
+        sector_keys,
+        on=[
+            "YEAR",
+            "MACRO_SECTOR",
+        ],
+        how="inner",
+        validate="many_to_one",
+    )
+
+    if filtered.empty:
+        raise ValueError(
+            "Nenhuma ação permaneceu após aplicar TOP4_1Y."
+        )
+
+    return filtered
 
 
 # ============================================================
@@ -335,10 +725,9 @@ def select_top3_per_sector(
     dentro de cada YEAR × MACRO_SECTOR.
 
     Desempate:
+
         FINAL_SCORE decrescente
         TICKER crescente
-
-    Essa ordem mantém a seleção determinística.
     """
 
     required = [
@@ -376,7 +765,10 @@ def select_top3_per_sector(
     selected = (
         eligible
         .groupby(
-            ["YEAR", "MACRO_SECTOR"],
+            [
+                "YEAR",
+                "MACRO_SECTOR",
+            ],
             observed=True,
             group_keys=False,
         )
@@ -387,7 +779,10 @@ def select_top3_per_sector(
     selected["RANK_IN_SECTOR"] = (
         selected
         .groupby(
-            ["YEAR", "MACRO_SECTOR"],
+            [
+                "YEAR",
+                "MACRO_SECTOR",
+            ],
             observed=True,
         )
         .cumcount()
@@ -398,15 +793,20 @@ def select_top3_per_sector(
 
 
 # ============================================================
-# AUDITORIA
+# AUDITORIA FINAL 4 × 3
 # ============================================================
 
 def audit_selection(
     selected: pd.DataFrame,
 ) -> None:
     """
-    Valida a arquitetura 4 × 3 depois que os quatro setores
-    TOP4_1Y já tiverem sido aplicados.
+    Confirma a arquitetura congelada:
+
+        4 setores
+        ×
+        3 ações
+        =
+        12 ações
     """
 
     if selected.empty:
@@ -414,9 +814,16 @@ def audit_selection(
             "AUDITORIA FAIL: nenhuma ação selecionada."
         )
 
-    for year, year_df in selected.groupby("YEAR"):
+    for year, year_df in selected.groupby(
+        "YEAR",
+        sort=True,
+    ):
 
-        sectors = year_df["MACRO_SECTOR"].nunique()
+        sectors = (
+            year_df["MACRO_SECTOR"]
+            .nunique()
+        )
+
         stocks = len(year_df)
 
         if sectors != N_SECTORS:
@@ -427,7 +834,8 @@ def audit_selection(
             )
 
         counts = (
-            year_df.groupby("MACRO_SECTOR")
+            year_df
+            .groupby("MACRO_SECTOR")
             .size()
         )
 
@@ -438,54 +846,112 @@ def audit_selection(
         if not invalid.empty:
             raise ValueError(
                 f"AUDITORIA FAIL — {year}: "
-                "nem todos os setores possuem "
-                f"{STOCKS_PER_SECTOR} ações."
+                "nem todos os setores possuem exatamente "
+                f"{STOCKS_PER_SECTOR} ações. "
+                f"Contagens: {counts.to_dict()}"
             )
 
-        expected_total = (
-            N_SECTORS
-            * STOCKS_PER_SECTOR
-        )
-
-        if stocks != expected_total:
+        if stocks != TOTAL_STOCKS:
             raise ValueError(
                 f"AUDITORIA FAIL — {year}: "
                 f"{stocks} ações encontradas; "
-                f"esperadas {expected_total}."
+                f"esperadas {TOTAL_STOCKS}."
             )
 
 
 # ============================================================
-# MOTOR
+# MOTOR COMPLETO
 # ============================================================
 
-def run_stock_selection(
+def run_portfolio_selection(
+    sector_rankings: pd.DataFrame,
     fundamentals: pd.DataFrame,
     price_factors: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Executa a etapa de seleção das ações.
+    Executa a cadeia de seleção da carteira:
 
-    IMPORTANTE:
-    Esta função pressupõe que os dados recebidos já estejam
-    restritos aos quatro setores definidos pelo TOP4_1Y.
-
-    A implementação do TOP4_1Y será incorporada somente quando
-    carregarmos o input histórico correspondente, para não
-    inventarmos dados ou regras que não estejam no estudo.
+        rankings históricos
+                ↓
+            TOP4_1Y
+                ↓
+          4 setores
+                ↓
+        FUND_SCORE
+                +
+        DISCOUNT_SCORE
+                ↓
+        FINAL_SCORE 80/20
+                ↓
+        Top 3 por setor
+                ↓
+          12 ações
     """
+
+    # --------------------------------------------------------
+    # 1. Selecionar dinamicamente os quatro setores
+    # --------------------------------------------------------
+
+    selected_sectors = select_top4_1y(
+        sector_rankings
+    )
+
+    # --------------------------------------------------------
+    # 2. Construir scores de TODAS as ações
+    # --------------------------------------------------------
 
     scores = build_final_scores(
         fundamentals,
         price_factors,
     )
 
-    selected = select_top3_per_sector(scores)
+    # --------------------------------------------------------
+    # 3. Restringir aos quatro setores TOP4_1Y
+    # --------------------------------------------------------
 
-    audit_selection(selected)
+    scores = apply_selected_sectors(
+        scores,
+        selected_sectors,
+    )
+
+    # --------------------------------------------------------
+    # 4. Selecionar Top 3 por setor
+    # --------------------------------------------------------
+
+    selected = select_top3_per_sector(
+        scores
+    )
+
+    # --------------------------------------------------------
+    # 5. Auditoria 4 × 3
+    # --------------------------------------------------------
+
+    audit_selection(
+        selected
+    )
+
+    # --------------------------------------------------------
+    # 6. Ordenação final
+    # --------------------------------------------------------
+
+    selected = selected.sort_values(
+        [
+            "YEAR",
+            "SECTOR_RANK",
+            "RANK_IN_SECTOR",
+            "TICKER",
+        ],
+        ascending=[
+            True,
+            True,
+            True,
+            True,
+        ],
+    )
 
     output_columns = [
         "YEAR",
+        "SECTOR_RANK",
         "MACRO_SECTOR",
         "RANK_IN_SECTOR",
         "TICKER",
@@ -496,13 +962,8 @@ def run_stock_selection(
     ]
 
     return (
-        selected[output_columns]
-        .sort_values(
-            [
-                "YEAR",
-                "MACRO_SECTOR",
-                "RANK_IN_SECTOR",
-            ]
-        )
+        selected[
+            output_columns
+        ]
         .reset_index(drop=True)
     )
