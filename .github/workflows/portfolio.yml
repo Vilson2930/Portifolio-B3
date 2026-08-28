@@ -36,6 +36,9 @@ jobs:
       - name: Build current B3 portfolio
         run: python update_portfolio.py
 
+      - name: Audit current B3 portfolio
+        run: python audit_portfolio.py
+
       - name: Upload historical reports
         if: always()
         uses: actions/upload-artifact@v4
