@@ -19,13 +19,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance
+          pip install pandas numpy yfinance requests
 
       - name: Run historical portfolio study
         run: python run.py
 
       - name: Update current B3 prices
         run: python update_prices.py
+
+      - name: Update current B3 fundamentals
+        run: python update_fundamentals.py
 
       - name: Upload historical reports
         if: always()
@@ -35,10 +38,10 @@ jobs:
           path: reports/
           if-no-files-found: warn
 
-      - name: Upload current price factors
+      - name: Upload current operational data
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: portfolio-b3-current-prices
+          name: portfolio-b3-current-data
           path: data_live/
           if-no-files-found: warn
