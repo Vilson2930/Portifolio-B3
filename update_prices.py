@@ -1,30 +1,14 @@
 """
-PORTIFOLIO-B3 — COLETOR OPERACIONAL DE PREÇOS + CLASSIFICAÇÃO SETORIAL
+PORTIFOLIO-B3 — PREÇOS OPERACIONAIS + SETORES COMPATÍVEIS COM O ESTUDO
 
-Objetivo:
-    Buscar o universo atual de ações da B3 e calcular:
+PRIORIDADE DA CLASSIFICAÇÃO:
 
-        MOM_6M        = retorno em 126 pregões
-        MOM_12M       = retorno em 252 pregões
-        DISCOUNT_52W  = distância positiva para a máxima dos últimos 252 pregões
+1. MACRO_SECTOR histórico do próprio estudo
+2. Outra classe da mesma empresa
+3. Classificação brapi para empresa nova
+4. UNCLASSIFIED se não houver evidência suficiente
 
-    Também classifica cada ativo nos mesmos macrosetores usados pelo estudo:
-
-        UTILITIES
-        INDUSTRIALS
-        FINANCIALS
-        CONSUMER
-        MATERIALS
-        TECHNOLOGY
-        ENERGY
-        HEALTHCARE
-        COMMUNICATION
-
-Saída:
-    data_live/price_factors_current.csv
-
-Importante:
-    Este arquivo NÃO altera os dados históricos validados em data/.
+O histórico congelado em data/ NÃO é alterado.
 """
 
 from __future__ import annotations
@@ -49,6 +33,7 @@ import yfinance as yf
 
 ROOT = Path(__file__).resolve().parent
 
+DATA_DIR = ROOT / "data"
 DATA_LIVE = ROOT / "data_live"
 
 OUTPUT_FILE = (
@@ -69,13 +54,14 @@ PRICE_PERIOD = "18mo"
 PRICE_INTERVAL = "1d"
 
 BATCH_SIZE = 80
-
 SLEEP_BETWEEN_BATCHES = 1.5
 
 TRADING_DAYS_6M = 126
 TRADING_DAYS_12M = 252
 
 MIN_OBS_DISCOUNT = 60
+
+MIN_SECTOR_COVERAGE = 0.95
 
 
 VALID_MACRO_SECTORS = {
@@ -109,51 +95,12 @@ def safe_float(value):
     return value
 
 
-def get_json(
-    url: str,
-    params: dict | None = None,
-) -> dict:
-
-    if params:
-
-        url = (
-            f"{url}?"
-            f"{urlencode(params)}"
-        )
-
-    request = Request(
-        url,
-        headers={
-            "User-Agent":
-                "Portfolio-B3/1.0",
-
-            "Accept":
-                "application/json",
-        },
-    )
-
-    with urlopen(
-        request,
-        timeout=60,
-    ) as response:
-
-        return json.loads(
-            response
-            .read()
-            .decode("utf-8")
-        )
-
-
-def normalize_text(value) -> str:
+def normalize_text(value):
 
     if value is None:
         return ""
 
-    text = (
-        str(value)
-        .strip()
-        .upper()
-    )
+    text = str(value).strip().upper()
 
     text = unicodedata.normalize(
         "NFKD",
@@ -175,14 +122,295 @@ def normalize_text(value) -> str:
     return text
 
 
+def get_json(
+    url,
+    params=None,
+):
+
+    if params:
+
+        url = (
+            f"{url}?"
+            f"{urlencode(params)}"
+        )
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent":
+                "Portfolio-B3/2.0",
+
+            "Accept":
+                "application/json",
+        },
+    )
+
+    with urlopen(
+        request,
+        timeout=60,
+    ) as response:
+
+        return json.loads(
+            response
+            .read()
+            .decode("utf-8")
+        )
+
+
+def ticker_root(ticker):
+
+    ticker = str(
+        ticker
+    ).strip().upper()
+
+    match = re.match(
+        r"^([A-Z]{4})",
+        ticker,
+    )
+
+    if not match:
+        return ""
+
+    return match.group(1)
+
+
 # =============================================================================
-# CLASSIFICAÇÃO MACROSETORIAL
+# FILTRO DE TICKERS
 # =============================================================================
 
-def classify_macro_sector(
-    sector_raw: str,
-    subsector_raw: str,
-) -> str:
+def is_equity_ticker(ticker):
+
+    ticker = str(
+        ticker
+    ).strip().upper()
+
+    # ON / PN / PNA / PNB / UNIT
+    #
+    # Exemplos:
+    # PETR3
+    # PETR4
+    # SANB11
+    # BPAC5
+    # MRSA3B
+
+    pattern = (
+        r"^[A-Z]{4}"
+        r"(3|4|5|6|11)"
+        r"B?$"
+    )
+
+    return bool(
+        re.match(
+            pattern,
+            ticker,
+        )
+    )
+
+
+# =============================================================================
+# CLASSIFICAÇÃO HISTÓRICA — FONTE PRINCIPAL
+# =============================================================================
+
+def load_historical_sector_map():
+
+    print()
+
+    print("=" * 78)
+
+    print(
+        "CLASSIFICAÇÃO SETORIAL — "
+        "MAPA HISTÓRICO DO ESTUDO"
+    )
+
+    print("=" * 78)
+
+
+    source_files = [
+
+        DATA_DIR
+        / "fundamental_factors.csv",
+
+        DATA_DIR
+        / "price_factors.csv",
+
+        DATA_DIR
+        / "returns.csv",
+    ]
+
+
+    frames = []
+
+
+    for path in source_files:
+
+        if not path.exists():
+            continue
+
+        df = pd.read_csv(
+            path,
+            low_memory=False,
+        )
+
+
+        required = {
+            "YEAR",
+            "TICKER",
+            "MACRO_SECTOR",
+        }
+
+
+        if not required.issubset(
+            df.columns
+        ):
+            continue
+
+
+        temp = df[
+            [
+                "YEAR",
+                "TICKER",
+                "MACRO_SECTOR",
+            ]
+        ].copy()
+
+
+        temp["YEAR"] = pd.to_numeric(
+            temp["YEAR"],
+            errors="coerce",
+        )
+
+
+        temp["TICKER"] = (
+
+            temp["TICKER"]
+
+            .astype(str)
+
+            .str.strip()
+
+            .str.upper()
+        )
+
+
+        temp["MACRO_SECTOR"] = (
+
+            temp["MACRO_SECTOR"]
+
+            .astype(str)
+
+            .str.strip()
+
+            .str.upper()
+        )
+
+
+        temp = temp[
+            temp["YEAR"].notna()
+            &
+            temp["TICKER"].notna()
+            &
+            temp["MACRO_SECTOR"].isin(
+                VALID_MACRO_SECTORS
+            )
+        ].copy()
+
+
+        frames.append(
+            temp
+        )
+
+
+    if not frames:
+
+        raise RuntimeError(
+            "Nenhuma classificação histórica "
+            "foi localizada em data/."
+        )
+
+
+    history = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+
+    history = (
+        history
+
+        .drop_duplicates(
+            [
+                "YEAR",
+                "TICKER",
+                "MACRO_SECTOR",
+            ]
+        )
+    )
+
+
+    history["YEAR"] = (
+        history["YEAR"]
+        .astype(int)
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Usa a classificação MAIS RECENTE disponível no estudo.
+    # -------------------------------------------------------------------------
+
+    latest = (
+
+        history
+
+        .sort_values(
+            [
+                "TICKER",
+                "YEAR",
+            ]
+        )
+
+        .groupby(
+            "TICKER",
+            as_index=False,
+        )
+
+        .tail(1)
+    )
+
+
+    sector_map = dict(
+        zip(
+            latest["TICKER"],
+            latest["MACRO_SECTOR"],
+        )
+    )
+
+
+    print(
+        f"Tickers históricos mapeados : "
+        f"{len(sector_map):,}"
+    )
+
+    print(
+        "Fonte                       : "
+        "DADOS CONGELADOS DO ESTUDO"
+    )
+
+    print(
+        "STATUS                      : PASS"
+    )
+
+
+    return sector_map
+
+
+# =============================================================================
+# FALLBACK PARA EMPRESAS NOVAS
+# =============================================================================
+
+def classify_new_ticker(
+    sector_raw,
+    subsector_raw,
+):
 
     sector = normalize_text(
         sector_raw
@@ -192,389 +420,242 @@ def classify_macro_sector(
         subsector_raw
     )
 
-    text = (
-        f"{sector} | "
-        f"{subsector}"
-    )
-
 
     # =========================================================================
-    # UTILITIES
+    # OVERRIDES DE SUBSETOR
     # =========================================================================
 
-    utility_terms = [
+    # Energia
 
-        "ENERGIA ELETRICA",
-        "ELECTRIC",
-
-        "UTILIDADE PUBLICA",
-        "UTILITIES",
-
-        "AGUA",
-        "WATER",
-
-        "SANEAMENTO",
-        "SANITATION",
-
-        "DISTRIBUICAO DE GAS",
-    ]
-
-    if any(
-        term in text
-        for term in utility_terms
-    ):
-        return "UTILITIES"
-
-
-    # =========================================================================
-    # ENERGY
-    # =========================================================================
-
-    energy_terms = [
-
-        "PETROLEO",
-        "PETROLEUM",
-
-        "OIL",
-
-        "GAS NATURAL",
-
-        "EXPLORACAO",
-        "EXPLORATION",
-
-        "REFINO",
-        "REFINING",
-
-        "COMBUSTIVEIS",
-        "FUEL",
-
-        "BIOCOMBUSTIVEIS",
-        "BIOFUEL",
-    ]
-
-    if any(
-        term in text
-        for term in energy_terms
-    ):
+    if subsector in {
+        "EXPLORACAO E PRODUCAO DE PETROLEO",
+        "EXPLORACAO. REFINO E DISTRIBUICAO",
+        "EXPLORACAO, REFINO E DISTRIBUICAO",
+        "PETROLEO E GAS INTEGRADO",
+    }:
         return "ENERGY"
 
 
-    # =========================================================================
-    # MATERIALS
-    # =========================================================================
+    # Utilities
 
-    materials_terms = [
-
-        "MINERACAO",
-        "MINING",
-
-        "SIDERURGIA",
-        "STEEL",
-
-        "METALURGIA",
-        "METALS",
-
-        "PAPEL",
-        "PAPER",
-
-        "CELULOSE",
-        "PULP",
-
-        "QUIMIC",
-        "CHEMICAL",
-
-        "PETROQUIMIC",
-
-        "CIMENTO",
-        "CEMENT",
-
-        "MADEIRA",
-        "WOOD",
-
-        "MATERIAIS",
-        "MATERIALS",
-
-        "EMBALAGENS",
-        "PACKAGING",
-    ]
-
-    if any(
-        term in text
-        for term in materials_terms
-    ):
-        return "MATERIALS"
+    if subsector in {
+        "ENERGIA ELETRICA",
+        "AGUA E SANEAMENTO",
+        "GAS",
+    }:
+        return "UTILITIES"
 
 
-    # =========================================================================
-    # FINANCIALS
-    # =========================================================================
+    # Healthcare
 
-    financial_terms = [
-
-        "BANC",
-        "BANK",
-
-        "FINANCEIR",
-        "FINANCIAL",
-
-        "SEGURO",
-        "INSURANCE",
-
-        "PREVIDENCIA",
-
-        "CAPITALIZACAO",
-
-        "CORRETOR",
-        "BROKER",
-
-        "BOLSA",
-        "EXCHANGE",
-
-        "SERVICOS FINANCEIROS",
-
-        "FINANCIAL SERVICES",
-
-        "HOLDINGS DIVERSIFICADAS",
-    ]
-
-    if any(
-        term in text
-        for term in financial_terms
-    ):
-        return "FINANCIALS"
-
-
-    # =========================================================================
-    # TECHNOLOGY
-    # =========================================================================
-
-    technology_terms = [
-
-        "TECNOLOGIA",
-        "TECHNOLOGY",
-
-        "SOFTWARE",
-
-        "COMPUTADOR",
-        "COMPUTER",
-
-        "SEMICONDUTOR",
-        "SEMICONDUCTOR",
-
-        "SERVICOS DE TI",
-
-        "INFORMATION TECHNOLOGY",
-
-        "SISTEMAS",
-        "SYSTEMS",
-
-        "EQUIPAMENTOS DE INFORMATICA",
-
-        "ELETRONIC",
-    ]
-
-    if any(
-        term in text
-        for term in technology_terms
-    ):
-        return "TECHNOLOGY"
-
-
-    # =========================================================================
-    # COMMUNICATION
-    # =========================================================================
-
-    communication_terms = [
-
-        "TELECOM",
-
-        "COMMUNICATION",
-
-        "COMUNICACAO",
-
-        "MIDIA",
-        "MEDIA",
-
-        "PUBLICIDADE",
-        "ADVERTISING",
-
-        "INTERNET",
-    ]
-
-    if any(
-        term in text
-        for term in communication_terms
-    ):
-        return "COMMUNICATION"
-
-
-    # =========================================================================
-    # HEALTHCARE
-    # =========================================================================
-
-    healthcare_terms = [
-
-        "SAUDE",
-        "HEALTH",
-
-        "HOSPITAL",
-        "HOSPITAIS",
-
-        "MEDIC",
-        "MEDICAL",
-
-        "FARMAC",
-        "PHARMA",
-
-        "DIAGNOSTICO",
-        "DIAGNOSTIC",
-
-        "LABORATOR",
-
-        "ODONTO",
-        "DENTAL",
-
-        "EQUIPAMENTOS MEDICOS",
-    ]
-
-    if any(
-        term in text
-        for term in healthcare_terms
+    if (
+        "MEDICAMENTO" in subsector
+        or
+        "SERVICOS MEDICOS" in subsector
+        or
+        "ANALISES E DIAGNOSTICOS" in subsector
     ):
         return "HEALTHCARE"
 
 
-    # =========================================================================
-    # INDUSTRIALS
-    # =========================================================================
+    # Construção / incorporação pertence a INDUSTRIALS
+    # conforme o universo congelado do estudo.
 
-    industrial_terms = [
+    if subsector in {
+        "INCORPORACOES",
+        "CONSTRUCAO PESADA",
+        "PRODUTOS PARA CONSTRUCAO",
+        "EXPLORACAO DE RODOVIAS",
+    }:
+        return "INDUSTRIALS"
 
-        "INDUSTRIAL",
 
-        "MAQUINAS",
-        "MACHINERY",
+    # Transporte / máquinas / defesa
 
-        "EQUIPAMENTOS",
-        "EQUIPMENT",
-
-        "CONSTRUCAO",
-        "CONSTRUCTION",
-
-        "TRANSPORTE",
-        "TRANSPORT",
-
-        "LOGISTICA",
-        "LOGISTICS",
-
-        "FERROVI",
-        "RAIL",
-
-        "RODOVI",
-        "HIGHWAY",
-
-        "AERONAUT",
-        "AEROSPACE",
-
-        "DEFESA",
-        "DEFENSE",
-
-        "SERVICOS INDUSTRIAIS",
-
-        "ENGINEERING",
-        "ENGENHARIA",
-    ]
-
-    if any(
-        term in text
-        for term in industrial_terms
+    if (
+        "TRANSPORTE " in subsector
+        or
+        "MAQ. E EQUIP." in subsector
+        or
+        "MAQUINAS E EQUIPAMENTOS" in subsector
+        or
+        "MATERIAL RODOVIARIO" in subsector
+        or
+        "MATERIAL DE TRANSPORTE" in subsector
+        or
+        "MATERIAL AERONAUTICO" in subsector
+        or
+        "ARMAS E MUNICOES" in subsector
     ):
         return "INDUSTRIALS"
 
 
-    # =========================================================================
-    # CONSUMER
-    # =========================================================================
+    # Tecnologia
+
+    if subsector in {
+        "PROGRAMAS E SERVICOS",
+        "PROGRAMAS DE FIDELIZACAO",
+        "COMPUTADORES E EQUIPAMENTOS",
+    }:
+        return "TECHNOLOGY"
+
+
+    # Telecom
+
+    if subsector == "TELECOMUNICACOES":
+        return "COMMUNICATION"
+
+
+    # Financeiro
+
+    if (
+        "BANCOS" in subsector
+        or
+        "SEGURADOR" in subsector
+        or
+        "RESSEGURADOR" in subsector
+        or
+        "SERVICOS FINANCEIROS" in subsector
+        or
+        "BOLSAS DE VALORES" in subsector
+        or
+        "HOLDINGS DIVERSIFICADAS" in subsector
+    ):
+        return "FINANCIALS"
+
+
+    # Materiais
+
+    if (
+        "SIDERURGIA" in subsector
+        or
+        "MINERA" in subsector
+        or
+        "MINERAIS METALICOS" in subsector
+        or
+        "PETROQUIM" in subsector
+        or
+        "QUIMIC" in subsector
+        or
+        "PAPEL E CELULOSE" in subsector
+        or
+        "FERTILIZANTES" in subsector
+        or
+        "ARTEFATOS DE COBRE" in subsector
+        or
+        "ARTEFATOS DE FERRO" in subsector
+    ):
+        return "MATERIALS"
+
+
+    # Consumo
 
     consumer_terms = [
-
-        "CONSUMO",
-        "CONSUMER",
-
-        "VAREJO",
-        "RETAIL",
-
         "ALIMENT",
-        "FOOD",
-
         "BEBIDA",
-        "BEVERAGE",
-
-        "VESTUARIO",
-        "APPAREL",
-
-        "CALCAD",
-        "FOOTWEAR",
-
-        "AUTOMOVEIS",
-        "AUTOMOTIVE",
-
-        "HOTEL",
-        "HOTEIS",
-
-        "RESTAURANT",
-
-        "TURISMO",
-        "TOURISM",
-
-        "EDUCACAO",
-        "EDUCATION",
-
-        "COMERCIO",
-        "COMMERCE",
-
-        "E-COMMERCE",
-
-        "AGRICULTURA",
-        "AGRICULTURE",
-
-        "AGRO",
-
         "CARNES",
-        "MEAT",
-
+        "CALCAD",
+        "VESTUARIO",
+        "TECIDOS",
+        "MOVEIS",
+        "ELETRODOMESTICOS",
+        "AGRICULTURA",
+        "ACUCAR E ALCOOL",
+        "RESTAURANTE",
+        "TURISMO",
+        "SERVICOS EDUCACIONAIS",
+        "ATIVIDADES ESPORTIVAS",
         "PRODUTOS DE USO PESSOAL",
-
-        "PERSONAL PRODUCTS",
-
-        "PRODUTOS DOMESTICOS",
-
-        "HOUSEHOLD",
+        "AUTOMOVEIS E MOTOCICLETAS",
+        "BICICLETAS",
     ]
 
+
     if any(
-        term in text
+        term in subsector
         for term in consumer_terms
     ):
         return "CONSUMER"
 
 
     # =========================================================================
-    # NÃO FORÇAR CLASSIFICAÇÃO
+    # FALLBACK PELO SETOR PRINCIPAL
     # =========================================================================
+
+    sector_map = {
+
+        "COMMUNICATIONS":
+            "COMMUNICATION",
+
+        "HEALTH SERVICES":
+            "HEALTHCARE",
+
+        "HEALTH TECHNOLOGY":
+            "HEALTHCARE",
+
+        "ENERGY MINERALS":
+            "ENERGY",
+
+        "UTILITIES":
+            "UTILITIES",
+
+        "TECHNOLOGY SERVICES":
+            "TECHNOLOGY",
+
+        "ELECTRONIC TECHNOLOGY":
+            "TECHNOLOGY",
+
+        "TRANSPORTATION":
+            "INDUSTRIALS",
+
+        "INDUSTRIAL SERVICES":
+            "INDUSTRIALS",
+
+        "PRODUCER MANUFACTURING":
+            "INDUSTRIALS",
+
+        "NON-ENERGY MINERALS":
+            "MATERIALS",
+
+        "FINANCE":
+            "FINANCIALS",
+
+        "CONSUMER DURABLES":
+            "CONSUMER",
+
+        "CONSUMER NON-DURABLES":
+            "CONSUMER",
+
+        "CONSUMER SERVICES":
+            "CONSUMER",
+
+        "RETAIL TRADE":
+            "CONSUMER",
+    }
+
+
+    if sector in sector_map:
+
+        return sector_map[
+            sector
+        ]
+
 
     return "UNCLASSIFIED"
 
 
 # =============================================================================
-# UNIVERSO ATUAL DA B3
+# UNIVERSO ATUAL
 # =============================================================================
 
-def fetch_current_b3_universe() -> pd.DataFrame:
+def fetch_current_b3_universe(
+    historical_sector_map,
+):
 
     rows = []
 
     page = 1
+
 
     print()
 
@@ -626,36 +707,19 @@ def fetch_current_b3_universe() -> pd.DataFrame:
             ).strip().upper()
 
 
-            if not ticker:
-                continue
-
-
-            # Evita mercado fracionário
-
-            if ticker.endswith("F"):
-                continue
-
-
-            # Mantém apenas símbolos com número
-
-            if not any(
-                ch.isdigit()
-                for ch in ticker
+            if not is_equity_ticker(
+                ticker
             ):
                 continue
 
 
             sector_raw = (
 
-                item.get(
-                    "sector"
-                )
+                item.get("sector")
 
                 or
 
-                item.get(
-                    "sectorName"
-                )
+                item.get("sectorName")
 
                 or
 
@@ -665,21 +729,15 @@ def fetch_current_b3_universe() -> pd.DataFrame:
 
             subsector_raw = (
 
-                item.get(
-                    "subsector"
-                )
+                item.get("subsector")
 
                 or
 
-                item.get(
-                    "subSector"
-                )
+                item.get("subSector")
 
                 or
 
-                item.get(
-                    "subsectorName"
-                )
+                item.get("subsectorName")
 
                 or
 
@@ -687,18 +745,62 @@ def fetch_current_b3_universe() -> pd.DataFrame:
             )
 
 
-            macro_sector = (
-                classify_macro_sector(
-                    sector_raw,
-                    subsector_raw,
+            # -----------------------------------------------------------------
+            # PRIORIDADE 1 — CLASSIFICAÇÃO DO ESTUDO
+            # -----------------------------------------------------------------
+
+            if ticker in historical_sector_map:
+
+                macro_sector = (
+                    historical_sector_map[
+                        ticker
+                    ]
                 )
-            )
+
+                source = (
+                    "HISTORICAL_STUDY"
+                )
+
+
+            # -----------------------------------------------------------------
+            # PRIORIDADE 2 — BRAPI PARA TICKER NOVO
+            # -----------------------------------------------------------------
+
+            else:
+
+                macro_sector = (
+                    classify_new_ticker(
+                        sector_raw,
+                        subsector_raw,
+                    )
+                )
+
+                if (
+                    macro_sector
+                    ==
+                    "UNCLASSIFIED"
+                ):
+
+                    source = (
+                        "UNCLASSIFIED"
+                    )
+
+                else:
+
+                    source = (
+                        "BRAPI_FALLBACK"
+                    )
 
 
             rows.append(
                 {
                     "TICKER":
                         ticker,
+
+                    "ROOT":
+                        ticker_root(
+                            ticker
+                        ),
 
                     "SECTOR_RAW":
                         str(
@@ -712,19 +814,19 @@ def fetch_current_b3_universe() -> pd.DataFrame:
 
                     "MACRO_SECTOR":
                         macro_sector,
+
+                    "CLASSIFICATION_SOURCE":
+                        source,
                 }
             )
 
 
-        has_next = bool(
+        if not bool(
             payload.get(
                 "hasNextPage",
                 False,
             )
-        )
-
-
-        if not has_next:
+        ):
             break
 
 
@@ -734,7 +836,7 @@ def fetch_current_b3_universe() -> pd.DataFrame:
         if page > 100:
 
             raise RuntimeError(
-                "Paginação do universo excedeu "
+                "Paginação excedeu "
                 "o limite de segurança."
             )
 
@@ -747,8 +849,7 @@ def fetch_current_b3_universe() -> pd.DataFrame:
     if universe.empty:
 
         raise RuntimeError(
-            "Nenhum ticker foi encontrado "
-            "no universo atual da B3."
+            "Universo atual vazio."
         )
 
 
@@ -757,9 +858,95 @@ def fetch_current_b3_universe() -> pd.DataFrame:
         universe
 
         .drop_duplicates(
-            ["TICKER"],
-            keep="first",
+            ["TICKER"]
         )
+
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+    # =========================================================================
+    # HERANÇA ENTRE CLASSES DA MESMA EMPRESA
+    # =========================================================================
+
+    root_sector = {}
+
+
+    classified = universe[
+        universe[
+            "MACRO_SECTOR"
+        ]
+        .isin(
+            VALID_MACRO_SECTORS
+        )
+    ]
+
+
+    for root, group in classified.groupby(
+        "ROOT"
+    ):
+
+        sectors = (
+            group[
+                "MACRO_SECTOR"
+            ]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+
+        if len(
+            sectors
+        ) == 1:
+
+            root_sector[
+                root
+            ] = sectors[0]
+
+
+    mask = (
+        universe[
+            "MACRO_SECTOR"
+        ]
+        ==
+        "UNCLASSIFIED"
+    )
+
+
+    for idx in universe[
+        mask
+    ].index:
+
+        root = universe.at[
+            idx,
+            "ROOT",
+        ]
+
+
+        if root in root_sector:
+
+            universe.at[
+                idx,
+                "MACRO_SECTOR",
+            ] = root_sector[
+                root
+            ]
+
+
+            universe.at[
+                idx,
+                "CLASSIFICATION_SOURCE",
+            ] = (
+                "SAME_COMPANY"
+            )
+
+
+    universe = (
+
+        universe
 
         .sort_values(
             "TICKER"
@@ -771,39 +958,33 @@ def fetch_current_b3_universe() -> pd.DataFrame:
     )
 
 
-    classified = (
-
-        universe[
-            "MACRO_SECTOR"
-        ]
-
-        !=
-
-        "UNCLASSIFIED"
-    )
-
-
     print(
         f"Tickers atuais encontrados : "
         f"{len(universe):,}"
     )
 
 
-    print(
-        f"Macrosetores classificados : "
-        f"{classified.sum():,}"
+    print()
+
+
+    source_counts = (
+
+        universe[
+            "CLASSIFICATION_SOURCE"
+        ]
+
+        .value_counts()
     )
 
 
-    print(
-        f"Não classificados          : "
-        f"{(~classified).sum():,}"
-    )
+    for source, count in (
+        source_counts.items()
+    ):
 
-
-    print(
-        "STATUS                     : PASS"
-    )
+        print(
+            f"{source:<24}: "
+            f"{count:,}"
+        )
 
 
     return universe
@@ -814,8 +995,8 @@ def fetch_current_b3_universe() -> pd.DataFrame:
 # =============================================================================
 
 def yahoo_symbol(
-    ticker: str,
-) -> str:
+    ticker,
+):
 
     return (
         f"{ticker}.SA"
@@ -823,9 +1004,8 @@ def yahoo_symbol(
 
 
 def download_batch(
-    tickers: list[str],
-) -> pd.DataFrame:
-
+    tickers,
+):
 
     symbols = [
 
@@ -863,10 +1043,9 @@ def download_batch(
 
 
 def extract_close_series(
-    data: pd.DataFrame,
-    symbol: str,
-) -> pd.Series:
-
+    data,
+    symbol,
+):
 
     try:
 
@@ -919,17 +1098,17 @@ def extract_close_series(
         )
 
 
-        series = (
-            series[
-                series.index.notna()
-            ]
-        )
+        series = series[
+            series.index.notna()
+        ]
 
 
         series = (
 
             series[
-                ~series.index.duplicated(
+                ~series
+                .index
+                .duplicated(
                     keep="last"
                 )
             ]
@@ -949,16 +1128,17 @@ def extract_close_series(
 
 
 # =============================================================================
-# FATORES — MESMA DEFINIÇÃO DO ESTUDO
+# FATORES DE PREÇO
 # =============================================================================
 
 def price_return(
-    series: pd.Series,
-    trading_days: int,
+    series,
+    trading_days,
 ):
 
-
-    if len(series) <= trading_days:
+    if len(
+        series
+    ) <= trading_days:
 
         return np.nan
 
@@ -977,15 +1157,10 @@ def price_return(
 
 
     if (
-
         pd.isna(current)
-
         or
-
         pd.isna(previous)
-
         or
-
         previous <= 0
     ):
 
@@ -993,7 +1168,6 @@ def price_return(
 
 
     return (
-
         current
         /
         previous
@@ -1003,23 +1177,21 @@ def price_return(
 
 
 def discount_52w(
-    series: pd.Series,
+    series,
 ):
 
-
     if series.empty:
-
         return np.nan
 
 
-    window = (
-        series.tail(
-            TRADING_DAYS_12M
-        )
+    window = series.tail(
+        TRADING_DAYS_12M
     )
 
 
-    if len(window) < MIN_OBS_DISCOUNT:
+    if len(
+        window
+    ) < MIN_OBS_DISCOUNT:
 
         return np.nan
 
@@ -1035,15 +1207,10 @@ def discount_52w(
 
 
     if (
-
         pd.isna(current)
-
         or
-
         pd.isna(high)
-
         or
-
         high <= 0
     ):
 
@@ -1051,22 +1218,19 @@ def discount_52w(
 
 
     return (
-
         high
         -
         current
-
     ) / high
 
 
 # =============================================================================
-# CONSTRUÇÃO DA BASE OPERACIONAL
+# BASE OPERACIONAL
 # =============================================================================
 
 def build_current_price_factors(
-    universe: pd.DataFrame,
-) -> pd.DataFrame:
-
+    universe,
+):
 
     print()
 
@@ -1090,7 +1254,7 @@ def build_current_price_factors(
     )
 
 
-    universe_lookup = (
+    metadata = (
 
         universe
 
@@ -1125,27 +1289,22 @@ def build_current_price_factors(
 
 
         batch_number = (
-
             start
             //
             BATCH_SIZE
-
         ) + 1
 
 
         total_batches = (
-
             total
             +
             BATCH_SIZE
             -
             1
-
         ) // BATCH_SIZE
 
 
         print(
-
             f"Batch "
             f"{batch_number}/"
             f"{total_batches} "
@@ -1155,17 +1314,15 @@ def build_current_price_factors(
 
         try:
 
-            data = (
-                download_batch(
-                    batch
-                )
+            data = download_batch(
+                batch
             )
 
 
         except Exception as exc:
 
             print(
-                f"  ERRO no batch: "
+                f"ERRO batch: "
                 f"{exc}"
             )
 
@@ -1174,11 +1331,8 @@ def build_current_price_factors(
 
         for ticker in batch:
 
-
-            symbol = (
-                yahoo_symbol(
-                    ticker
-                )
+            symbol = yahoo_symbol(
+                ticker
             )
 
 
@@ -1191,36 +1345,16 @@ def build_current_price_factors(
 
 
             if series.empty:
-
                 continue
 
 
-            metadata = (
-                universe_lookup[
-                    ticker
-                ]
-            )
-
-
-            current_price = (
-                safe_float(
-                    series.iloc[-1]
-                )
-            )
-
-
-            price_date = (
-
-                series
-                .index[-1]
-                .date()
-                .isoformat()
-            )
+            meta = metadata[
+                ticker
+            ]
 
 
             rows.append(
                 {
-
                     "YEAR":
                         datetime.now().year,
 
@@ -1228,17 +1362,22 @@ def build_current_price_factors(
                         ticker,
 
                     "MACRO_SECTOR":
-                        metadata[
+                        meta[
                             "MACRO_SECTOR"
                         ],
 
+                    "CLASSIFICATION_SOURCE":
+                        meta[
+                            "CLASSIFICATION_SOURCE"
+                        ],
+
                     "SECTOR_RAW":
-                        metadata[
+                        meta[
                             "SECTOR_RAW"
                         ],
 
                     "SUBSECTOR_RAW":
-                        metadata[
+                        meta[
                             "SUBSECTOR_RAW"
                         ],
 
@@ -1260,10 +1399,15 @@ def build_current_price_factors(
                         ),
 
                     "LAST_PRICE":
-                        current_price,
+                        safe_float(
+                            series.iloc[-1]
+                        ),
 
                     "PRICE_DATE":
-                        price_date,
+                        series
+                        .index[-1]
+                        .date()
+                        .isoformat(),
 
                     "OBS_AVAILABLE":
                         len(series),
@@ -1272,7 +1416,6 @@ def build_current_price_factors(
 
 
         if (
-
             start
             +
             BATCH_SIZE
@@ -1293,7 +1436,7 @@ def build_current_price_factors(
     if factors.empty:
 
         raise RuntimeError(
-            "Nenhum fator de preço foi calculado."
+            "Nenhum fator calculado."
         )
 
 
@@ -1321,39 +1464,6 @@ def build_current_price_factors(
     )
 
 
-    print()
-
-
-    print(
-        f"Tickers com preço           : "
-        f"{len(factors):,}"
-    )
-
-
-    print(
-        "MOM_6M válido              : "
-        f"{factors['MOM_6M'].notna().sum():,}"
-    )
-
-
-    print(
-        "MOM_12M válido             : "
-        f"{factors['MOM_12M'].notna().sum():,}"
-    )
-
-
-    print(
-        "DISCOUNT_52W válido        : "
-        f"{factors['DISCOUNT_52W'].notna().sum():,}"
-    )
-
-
-    print(
-        "MACRO_SECTOR válido        : "
-        f"{(factors['MACRO_SECTOR'] != 'UNCLASSIFIED').sum():,}"
-    )
-
-
     return factors
 
 
@@ -1361,46 +1471,19 @@ def build_current_price_factors(
 # AUDITORIA
 # =============================================================================
 
-def audit_price_factors(
-    factors: pd.DataFrame,
-) -> None:
+def audit(
+    factors,
+):
 
+    print()
 
-    required = {
+    print("=" * 78)
 
-        "YEAR",
-        "TICKER",
-
-        "MACRO_SECTOR",
-        "SECTOR_RAW",
-        "SUBSECTOR_RAW",
-
-        "MOM_6M",
-        "MOM_12M",
-        "DISCOUNT_52W",
-
-        "LAST_PRICE",
-        "PRICE_DATE",
-        "OBS_AVAILABLE",
-    }
-
-
-    missing = (
-
-        required
-        -
-        set(
-            factors.columns
-        )
+    print(
+        "ETAPA 3 — AUDITORIA"
     )
 
-
-    if missing:
-
-        raise RuntimeError(
-            f"Colunas ausentes: "
-            f"{sorted(missing)}"
-        )
+    print("=" * 78)
 
 
     duplicates = (
@@ -1418,61 +1501,7 @@ def audit_price_factors(
     )
 
 
-    if duplicates:
-
-        raise RuntimeError(
-
-            f"Duplicidades YEAR × TICKER: "
-            f"{duplicates}"
-        )
-
-
-    if (
-
-        factors[
-            "DISCOUNT_52W"
-        ]
-
-        .dropna()
-
-        .lt(0)
-
-        .any()
-    ):
-
-        raise RuntimeError(
-            "DISCOUNT_52W negativo encontrado."
-        )
-
-
-    invalid_macro = (
-
-        ~factors[
-            "MACRO_SECTOR"
-        ]
-
-        .isin(
-
-            VALID_MACRO_SECTORS
-            |
-            {
-                "UNCLASSIFIED"
-            }
-        )
-
-    ).sum()
-
-
-    if invalid_macro:
-
-        raise RuntimeError(
-
-            f"Macrosetores inválidos: "
-            f"{invalid_macro}"
-        )
-
-
-    coverage_12m = (
+    coverage_price = (
 
         factors[
             "MOM_12M"
@@ -1484,109 +1513,136 @@ def audit_price_factors(
     )
 
 
-    classified_mask = (
+    classified = (
 
         factors[
             "MACRO_SECTOR"
         ]
 
-        !=
-
-        "UNCLASSIFIED"
+        .isin(
+            VALID_MACRO_SECTORS
+        )
     )
 
 
-    classification_coverage = (
-        classified_mask.mean()
+    sector_coverage = (
+        classified.mean()
     )
-
-
-    classified_count = int(
-        classified_mask.sum()
-    )
-
-
-    unclassified_count = int(
-
-        (
-            ~classified_mask
-        ).sum()
-    )
-
-
-    print()
-
-    print("=" * 78)
-
-    print(
-        "ETAPA 3 — AUDITORIA"
-    )
-
-    print("=" * 78)
 
 
     print(
+        f"Tickers com preço ................. "
+        f"{len(factors):,}"
+    )
 
-        f"Duplicidades YEAR × TICKER ....... "
+
+    print(
+        f"Duplicidades ...................... "
         f"{duplicates}"
     )
 
 
     print(
-
-        f"Cobertura MOM_12M ................ "
-        f"{coverage_12m:.2%}"
+        f"Cobertura MOM_12M ................. "
+        f"{coverage_price:.2%}"
     )
 
 
     print(
-
-        f"Cobertura MACRO_SECTOR ........... "
-        f"{classification_coverage:.2%}"
+        f"Cobertura MACRO_SECTOR ............ "
+        f"{sector_coverage:.2%}"
     )
 
 
     print(
-
-        f"Tickers classificados ............ "
-        f"{classified_count:,}"
+        f"Classificados ..................... "
+        f"{classified.sum():,}"
     )
 
 
     print(
+        f"Não classificados ................. "
+        f"{(~classified).sum():,}"
+    )
 
-        f"Tickers não classificados ........ "
-        f"{unclassified_count:,}"
+
+    print()
+
+    print(
+        "ORIGEM DAS CLASSIFICAÇÕES"
+    )
+
+    print("-" * 78)
+
+
+    counts = (
+
+        factors[
+            "CLASSIFICATION_SOURCE"
+        ]
+
+        .value_counts()
+    )
+
+
+    for source, count in (
+        counts.items()
+    ):
+
+        print(
+            f"{source:<24} "
+            f"{count:>5,}"
+        )
+
+
+    print()
+
+
+    if duplicates != 0:
+
+        raise RuntimeError(
+            "Duplicidades encontradas."
+        )
+
+
+    if sector_coverage < (
+        MIN_SECTOR_COVERAGE
+    ):
+
+        raise RuntimeError(
+            "Cobertura setorial abaixo "
+            f"de {MIN_SECTOR_COVERAGE:.0%}."
+        )
+
+
+    print(
+        "TOP4 taxonomy compatível "
+        "com estudo ................. PASS"
     )
 
 
     print(
-        "Definição MOM_6M = 126 pregões ... PASS"
+        "MOM_6M = 126 pregões ............. PASS"
     )
 
 
     print(
-        "Definição MOM_12M = 252 pregões .. PASS"
+        "MOM_12M = 252 pregões ............ PASS"
     )
 
 
     print(
-        "Definição Discount 52W ............ PASS"
+        "Discount 52W ..................... PASS"
     )
 
 
     print(
-        "Taxonomia macrosetorial ........... PASS"
+        "Histórico congelado .............. PRESERVADO"
     )
 
 
     print(
-        "Dados históricos congelados ....... PRESERVADOS"
-    )
-
-
-    print(
-        "STATUS ............................. PASS"
+        "STATUS ........................... PASS"
     )
 
 
@@ -1596,21 +1652,27 @@ def audit_price_factors(
 
 def main():
 
-
     print()
 
     print("=" * 78)
 
     print(
-        "PORTIFOLIO-B3 — ATUALIZAÇÃO OPERACIONAL "
-        "DE PREÇOS + SETORES"
+        "PORTIFOLIO-B3 — "
+        "PREÇOS + SETORES OPERACIONAIS"
     )
 
     print("=" * 78)
 
 
+    historical_sector_map = (
+        load_historical_sector_map()
+    )
+
+
     universe = (
-        fetch_current_b3_universe()
+        fetch_current_b3_universe(
+            historical_sector_map
+        )
     )
 
 
@@ -1621,7 +1683,7 @@ def main():
     )
 
 
-    audit_price_factors(
+    audit(
         factors
     )
 
@@ -1639,26 +1701,13 @@ def main():
     )
 
 
-    unclassified = (
-
+    unclassified = factors[
         factors[
-            factors[
-                "MACRO_SECTOR"
-            ]
-            ==
-            "UNCLASSIFIED"
+            "MACRO_SECTOR"
         ]
-
-        .copy()
-
-        .sort_values(
-            [
-                "SECTOR_RAW",
-                "SUBSECTOR_RAW",
-                "TICKER",
-            ]
-        )
-    )
+        ==
+        "UNCLASSIFIED"
+    ].copy()
 
 
     if not unclassified.empty:
@@ -1675,39 +1724,26 @@ def main():
     print("=" * 78)
 
     print(
-        "ARQUIVOS GERADOS"
+        "ARQUIVO GERADO"
     )
 
     print("=" * 78)
 
 
     print(
-
-        f"Fatores atuais      : "
-        f"{OUTPUT_FILE}"
+        OUTPUT_FILE
     )
-
-
-    if not unclassified.empty:
-
-        print(
-
-            f"Não classificados   : "
-            f"{UNCLASSIFIED_FILE}"
-        )
 
 
     print()
 
     print(
-        "STATUS: PREÇOS E CLASSIFICAÇÃO "
-        "SETORIAL OPERACIONAIS ATUALIZADOS"
+        "STATUS: CAMADA OPERACIONAL "
+        "DE PREÇOS E SETORES VALIDADA"
     )
 
 
     print("=" * 78)
-
-    print()
 
 
 if __name__ == "__main__":
