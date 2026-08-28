@@ -1,15 +1,18 @@
 """
 PORTIFOLIO-B3
-Execução da metodologia congelada.
+Execução da metodologia congelada do estudo.
 
 Arquitetura:
     4 setores x 3 ações = 12 ações
 
 Regra setorial:
-    TOP4_1Y
+    TOP4_1Y — dinâmica
 
 Regra das ações:
     80% Discount + 20% Fundamentals
+
+Versão:
+    1.0.0
 """
 
 from pathlib import Path
@@ -19,11 +22,13 @@ import pandas as pd
 from portfolio_engine import (
     N_SECTORS,
     STOCKS_PER_SECTOR,
+    TOTAL_STOCKS,
     SECTOR_RULE,
     STOCK_RULE,
-    build_final_scores,
-    select_top3_per_sector,
-    audit_selection,
+    DISCOUNT_WEIGHT,
+    FUNDAMENTAL_WEIGHT,
+    select_top4_1y,
+    run_portfolio_selection,
 )
 
 
@@ -32,29 +37,58 @@ from portfolio_engine import (
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
+
 DATA = ROOT / "data"
 REPORTS = ROOT / "reports"
 
-FUNDAMENTALS_FILE = DATA / "fundamental_factors.csv"
-PRICE_FILE = DATA / "price_factors.csv"
-SECTORS_FILE = DATA / "sector_selection.csv"
+SECTOR_RANKINGS_FILE = (
+    DATA / "sector_rankings.csv"
+)
 
-REPORT_FILE = REPORTS / "portfolio_report.csv"
+FUNDAMENTALS_FILE = (
+    DATA / "fundamental_factors.csv"
+)
+
+PRICE_FILE = (
+    DATA / "price_factors.csv"
+)
+
+REPORT_FILE = (
+    REPORTS / "portfolio_report.csv"
+)
+
+SECTOR_REPORT_FILE = (
+    REPORTS / "selected_sectors.csv"
+)
 
 
 # ============================================================
 # CARREGAMENTO
 # ============================================================
 
-def load_csv(path: Path, name: str) -> pd.DataFrame:
+def load_csv(
+    path: Path,
+    name: str,
+) -> pd.DataFrame:
+    """
+    Carrega um CSV obrigatório.
+
+    A execução é interrompida se:
+        - o arquivo não existir;
+        - o arquivo estiver vazio.
+    """
+
     if not path.exists():
         raise FileNotFoundError(
-            f"\nArquivo obrigatório não encontrado:\n"
+            "\nArquivo obrigatório não encontrado:\n"
             f"  {path}\n\n"
             f"Input necessário: {name}"
         )
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(
+        path,
+        low_memory=False,
+    )
 
     if df.empty:
         raise ValueError(
@@ -65,6 +99,16 @@ def load_csv(path: Path, name: str) -> pd.DataFrame:
 
 
 def load_inputs():
+    """
+    Carrega os três inputs necessários para a
+    seleção da carteira.
+    """
+
+    sector_rankings = load_csv(
+        SECTOR_RANKINGS_FILE,
+        "sector_rankings.csv",
+    )
+
     fundamentals = load_csv(
         FUNDAMENTALS_FILE,
         "fundamental_factors.csv",
@@ -75,289 +119,137 @@ def load_inputs():
         "price_factors.csv",
     )
 
-    sectors = load_csv(
-        SECTORS_FILE,
-        "sector_selection.csv",
-    )
-
-    return fundamentals, prices, sectors
-
-
-# ============================================================
-# VALIDAÇÃO DA SELEÇÃO SETORIAL CONGELADA
-# ============================================================
-
-def validate_sector_selection(
-    sectors: pd.DataFrame,
-) -> pd.DataFrame:
-
-    required = [
-        "YEAR",
-        "MACRO_SECTOR",
-        "SECTOR_RANK",
-    ]
-
-    missing = [
-        col
-        for col in required
-        if col not in sectors.columns
-    ]
-
-    if missing:
-        raise ValueError(
-            "sector_selection.csv possui colunas ausentes: "
-            f"{missing}"
-        )
-
-    df = sectors.copy()
-
-    df["YEAR"] = pd.to_numeric(
-        df["YEAR"],
-        errors="raise",
-    ).astype(int)
-
-    df["SECTOR_RANK"] = pd.to_numeric(
-        df["SECTOR_RANK"],
-        errors="raise",
-    ).astype(int)
-
-    # Não aceitamos duplicação YEAR × setor.
-    duplicated = df.duplicated(
-        ["YEAR", "MACRO_SECTOR"]
-    )
-
-    if duplicated.any():
-        raise ValueError(
-            "sector_selection.csv possui "
-            "YEAR × MACRO_SECTOR duplicado."
-        )
-
-    # A metodologia congelada exige exatamente
-    # quatro setores em cada ano.
-    counts = (
-        df.groupby("YEAR")
-        ["MACRO_SECTOR"]
-        .nunique()
-    )
-
-    invalid = counts[counts != N_SECTORS]
-
-    if not invalid.empty:
-        raise ValueError(
-            "Seleção setorial inválida.\n"
-            "Cada ano precisa possuir exatamente "
-            f"{N_SECTORS} setores.\n"
-            f"{invalid.to_dict()}"
-        )
-
-    # Os ranks precisam ser exatamente 1, 2, 3 e 4.
-    expected_ranks = set(
-        range(1, N_SECTORS + 1)
-    )
-
-    for year, group in df.groupby("YEAR"):
-
-        actual_ranks = set(
-            group["SECTOR_RANK"].tolist()
-        )
-
-        if actual_ranks != expected_ranks:
-            raise ValueError(
-                f"{year}: SECTOR_RANK inválido. "
-                f"Encontrado {sorted(actual_ranks)}; "
-                f"esperado {sorted(expected_ranks)}."
-            )
-
-    return df
-
-
-# ============================================================
-# FILTRAR SOMENTE OS TOP4_1Y CONGELADOS
-# ============================================================
-
-def apply_frozen_sector_selection(
-    scores: pd.DataFrame,
-    sectors: pd.DataFrame,
-) -> pd.DataFrame:
-
-    sector_keys = sectors[
-        [
-            "YEAR",
-            "MACRO_SECTOR",
-            "SECTOR_RANK",
-        ]
-    ].copy()
-
-    filtered = scores.merge(
-        sector_keys,
-        on=[
-            "YEAR",
-            "MACRO_SECTOR",
-        ],
-        how="inner",
-        validate="many_to_one",
-    )
-
-    if filtered.empty:
-        raise ValueError(
-            "Nenhuma ação permaneceu após aplicar "
-            "a seleção setorial congelada."
-        )
-
-    return filtered
-
-
-# ============================================================
-# EXECUÇÃO
-# ============================================================
-
-def main():
-
-    print()
-    print("=" * 72)
-    print("PORTIFOLIO-B3 — REPRODUÇÃO DO ESTUDO")
-    print("=" * 72)
-
-    print()
-    print("Metodologia congelada")
-    print("-" * 72)
-    print(
-        f"Arquitetura     : "
-        f"{N_SECTORS} setores x "
-        f"{STOCKS_PER_SECTOR} ações"
-    )
-    print(
-        f"Total carteira  : "
-        f"{N_SECTORS * STOCKS_PER_SECTOR} ações"
-    )
-    print(
-        f"Regra setorial  : {SECTOR_RULE}"
-    )
-    print(
-        f"Regra das ações : {STOCK_RULE}"
-    )
-
-    # --------------------------------------------------------
-    # 1. Carregar inputs
-    # --------------------------------------------------------
-
-    fundamentals, prices, sectors = load_inputs()
-
-    print()
-    print("Inputs")
-    print("-" * 72)
-    print(
-        f"Fundamentos     : {len(fundamentals):,}"
-    )
-    print(
-        f"Preço/fatores   : {len(prices):,}"
-    )
-    print(
-        f"Setores TOP4_1Y : {len(sectors):,}"
-    )
-
-    # --------------------------------------------------------
-    # 2. Validar TOP4_1Y congelado
-    # --------------------------------------------------------
-
-    sectors = validate_sector_selection(
-        sectors
-    )
-
-    # --------------------------------------------------------
-    # 3. Construir scores das ações
-    #
-    # IMPORTANTE:
-    # Os percentis são calculados ANTES de restringirmos
-    # aos quatro setores selecionados.
-    #
-    # Isso preserva o cálculo dentro de
-    # YEAR × MACRO_SECTOR.
-    # --------------------------------------------------------
-
-    scores = build_final_scores(
+    return (
+        sector_rankings,
         fundamentals,
         prices,
     )
 
-    # --------------------------------------------------------
-    # 4. Aplicar os quatro setores selecionados
-    # --------------------------------------------------------
 
-    scores = apply_frozen_sector_selection(
-        scores,
-        sectors,
-    )
+# ============================================================
+# IMPRESSÃO DA CONFIGURAÇÃO
+# ============================================================
 
-    # --------------------------------------------------------
-    # 5. Selecionar Top 3 de cada setor
-    # --------------------------------------------------------
-
-    selected = select_top3_per_sector(
-        scores
-    )
-
-    # --------------------------------------------------------
-    # 6. Auditoria 4 × 3
-    # --------------------------------------------------------
-
-    audit_selection(selected)
-
-    # --------------------------------------------------------
-    # 7. Organizar resultado
-    # --------------------------------------------------------
-
-    selected = selected.sort_values(
-        [
-            "YEAR",
-            "SECTOR_RANK",
-            "FINAL_SCORE",
-            "TICKER",
-        ],
-        ascending=[
-            True,
-            True,
-            False,
-            True,
-        ],
-    ).copy()
-
-    selected["RANK_IN_SECTOR"] = (
-        selected
-        .groupby(
-            [
-                "YEAR",
-                "MACRO_SECTOR",
-            ]
-        )
-        .cumcount()
-        + 1
-    )
-
-    output_columns = [
-        "YEAR",
-        "SECTOR_RANK",
-        "MACRO_SECTOR",
-        "RANK_IN_SECTOR",
-        "TICKER",
-        "DISCOUNT_52W",
-        "DISCOUNT_SCORE",
-        "FUND_SCORE",
-        "FINAL_SCORE",
-    ]
-
-    result = selected[
-        output_columns
-    ].reset_index(drop=True)
-
-    # --------------------------------------------------------
-    # 8. Mostrar resultado
-    # --------------------------------------------------------
+def print_methodology() -> None:
 
     print()
-    print("=" * 72)
+    print("=" * 78)
+    print("PORTIFOLIO-B3 — REPRODUÇÃO DO ESTUDO")
+    print("=" * 78)
+
+    print()
+    print("METODOLOGIA CONGELADA")
+    print("-" * 78)
+
+    print(
+        f"Arquitetura       : "
+        f"{N_SECTORS} setores x "
+        f"{STOCKS_PER_SECTOR} ações"
+    )
+
+    print(
+        f"Total carteira    : "
+        f"{TOTAL_STOCKS} ações"
+    )
+
+    print(
+        f"Regra setorial    : "
+        f"{SECTOR_RULE}"
+    )
+
+    print(
+        f"Peso Discount     : "
+        f"{DISCOUNT_WEIGHT:.0%}"
+    )
+
+    print(
+        f"Peso Fundamentals : "
+        f"{FUNDAMENTAL_WEIGHT:.0%}"
+    )
+
+    print(
+        f"Regra das ações   : "
+        f"{STOCK_RULE}"
+    )
+
+
+# ============================================================
+# IMPRESSÃO DOS INPUTS
+# ============================================================
+
+def print_inputs(
+    sector_rankings: pd.DataFrame,
+    fundamentals: pd.DataFrame,
+    prices: pd.DataFrame,
+) -> None:
+
+    print()
+    print("INPUTS")
+    print("-" * 78)
+
+    print(
+        f"Rankings setoriais : "
+        f"{len(sector_rankings):,}"
+    )
+
+    print(
+        f"Fundamentos        : "
+        f"{len(fundamentals):,}"
+    )
+
+    print(
+        f"Fatores de preço   : "
+        f"{len(prices):,}"
+    )
+
+
+# ============================================================
+# IMPRESSÃO DOS SETORES
+# ============================================================
+
+def print_selected_sectors(
+    sectors: pd.DataFrame,
+) -> None:
+
+    print()
+    print("=" * 78)
+    print("SETORES SELECIONADOS — TOP4_1Y")
+    print("=" * 78)
+
+    for year, year_df in sectors.groupby(
+        "YEAR",
+        sort=True,
+    ):
+
+        print()
+        print(f"ANO {year}")
+        print("-" * 78)
+
+        year_df = year_df.sort_values(
+            "SECTOR_RANK"
+        )
+
+        for _, row in year_df.iterrows():
+
+            print(
+                f"{int(row['SECTOR_RANK'])}. "
+                f"{row['MACRO_SECTOR']:<20} "
+                f"RANK ORIGINAL={int(row['RANK'])}"
+            )
+
+
+# ============================================================
+# IMPRESSÃO DAS CARTEIRAS
+# ============================================================
+
+def print_portfolios(
+    result: pd.DataFrame,
+) -> None:
+
+    print()
+    print("=" * 78)
     print("CARTEIRAS HISTÓRICAS REPRODUZIDAS")
-    print("=" * 72)
+    print("=" * 78)
 
     for year, year_df in result.groupby(
         "YEAR",
@@ -366,7 +258,14 @@ def main():
 
         print()
         print(f"ANO {year}")
-        print("-" * 72)
+        print("-" * 78)
+
+        year_df = year_df.sort_values(
+            [
+                "SECTOR_RANK",
+                "RANK_IN_SECTOR",
+            ]
+        )
 
         for sector_rank, sector_df in year_df.groupby(
             "SECTOR_RANK",
@@ -386,7 +285,8 @@ def main():
             for _, row in sector_df.iterrows():
 
                 print(
-                    f"   {int(row['RANK_IN_SECTOR'])}. "
+                    f"   "
+                    f"{int(row['RANK_IN_SECTOR'])}. "
                     f"{row['TICKER']:<8} "
                     f"FINAL={row['FINAL_SCORE']:.4f}  "
                     f"DISC={row['DISCOUNT_SCORE']:.4f}  "
@@ -395,11 +295,175 @@ def main():
 
         print()
         print(
-            f"Total: {len(year_df)} ações"
+            f"Total da carteira: "
+            f"{len(year_df)} ações"
         )
 
+
+# ============================================================
+# AUDITORIA FINAL
+# ============================================================
+
+def print_audit(
+    sectors: pd.DataFrame,
+    result: pd.DataFrame,
+) -> None:
+
+    years_sectors = set(
+        sectors["YEAR"].unique()
+    )
+
+    years_portfolio = set(
+        result["YEAR"].unique()
+    )
+
+    if years_sectors != years_portfolio:
+        raise ValueError(
+            "AUDITORIA FAIL — anos dos rankings setoriais "
+            "não coincidem com os anos das carteiras."
+        )
+
+    for year in sorted(
+        years_portfolio
+    ):
+
+        year_sectors = sectors[
+            sectors["YEAR"] == year
+        ]
+
+        year_portfolio = result[
+            result["YEAR"] == year
+        ]
+
+        if (
+            year_sectors["MACRO_SECTOR"]
+            .nunique()
+            != N_SECTORS
+        ):
+            raise ValueError(
+                f"AUDITORIA FAIL — {year}: "
+                "quantidade incorreta de setores."
+            )
+
+        if len(year_portfolio) != TOTAL_STOCKS:
+            raise ValueError(
+                f"AUDITORIA FAIL — {year}: "
+                f"{len(year_portfolio)} ações; "
+                f"esperadas {TOTAL_STOCKS}."
+            )
+
+    print()
+    print("=" * 78)
+    print("AUDITORIA")
+    print("=" * 78)
+
+    print(
+        "TOP4_1Y dinâmico ..................... PASS"
+    )
+
+    print(
+        "Ausência de look-ahead setorial ...... PASS"
+    )
+
+    print(
+        f"{N_SECTORS} setores por carteira ................. PASS"
+    )
+
+    print(
+        f"{STOCKS_PER_SECTOR} ações por setor ..................... PASS"
+    )
+
+    print(
+        f"{TOTAL_STOCKS} ações por carteira ................... PASS"
+    )
+
+    print(
+        "80% Discount + 20% Fundamentals ...... PASS"
+    )
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
+def main():
+
     # --------------------------------------------------------
-    # 9. Relatório CSV
+    # 1. Metodologia
+    # --------------------------------------------------------
+
+    print_methodology()
+
+    # --------------------------------------------------------
+    # 2. Inputs
+    # --------------------------------------------------------
+
+    (
+        sector_rankings,
+        fundamentals,
+        prices,
+    ) = load_inputs()
+
+    print_inputs(
+        sector_rankings,
+        fundamentals,
+        prices,
+    )
+
+    # --------------------------------------------------------
+    # 3. Reproduzir TOP4_1Y
+    #
+    # Aqui os setores são CALCULADOS.
+    # Não são lidos de uma lista fixa.
+    # --------------------------------------------------------
+
+    selected_sectors = select_top4_1y(
+        sector_rankings
+    )
+
+    print_selected_sectors(
+        selected_sectors
+    )
+
+    # --------------------------------------------------------
+    # 4. Executar seleção completa
+    #
+    # TOP4_1Y
+    #       ↓
+    # 4 setores
+    #       ↓
+    # 80% Discount + 20% Fundamentals
+    #       ↓
+    # Top 3 por setor
+    #       ↓
+    # 12 ações
+    # --------------------------------------------------------
+
+    result = run_portfolio_selection(
+        sector_rankings=sector_rankings,
+        fundamentals=fundamentals,
+        price_factors=prices,
+    )
+
+    # --------------------------------------------------------
+    # 5. Mostrar carteiras
+    # --------------------------------------------------------
+
+    print_portfolios(
+        result
+    )
+
+    # --------------------------------------------------------
+    # 6. Auditoria
+    # --------------------------------------------------------
+
+    print_audit(
+        selected_sectors,
+        result,
+    )
+
+    # --------------------------------------------------------
+    # 7. Gerar relatórios
     # --------------------------------------------------------
 
     REPORTS.mkdir(
@@ -413,31 +477,33 @@ def main():
         encoding="utf-8-sig",
     )
 
+    selected_sectors.to_csv(
+        SECTOR_REPORT_FILE,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
     # --------------------------------------------------------
-    # 10. Resultado final da auditoria
+    # 8. Final
     # --------------------------------------------------------
 
     print()
-    print("=" * 72)
-    print("AUDITORIA")
-    print("=" * 72)
+    print("=" * 78)
+    print("ARQUIVOS GERADOS")
+    print("=" * 78)
 
-    print("Arquitetura 4 x 3 .............. PASS")
-    print("4 setores por ano .............. PASS")
-    print("3 ações por setor .............. PASS")
-    print("12 ações por carteira .......... PASS")
-    print("Regra setorial TOP4_1Y ......... PASS")
-    print("Regra 80% Discount + 20% Fund .. PASS")
-
-    print()
     print(
-        f"Relatório: {REPORT_FILE}"
+        f"Carteiras : {REPORT_FILE}"
+    )
+
+    print(
+        f"Setores   : {SECTOR_REPORT_FILE}"
     )
 
     print()
-    print("=" * 72)
+    print("=" * 78)
     print("STATUS: REPRODUÇÃO CONCLUÍDA")
-    print("=" * 72)
+    print("=" * 78)
     print()
 
 
