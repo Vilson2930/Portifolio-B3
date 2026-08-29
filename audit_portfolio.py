@@ -41,7 +41,7 @@ for ticker in portfolio["TICKER"]:
             symbol,
             period="18mo",
             interval="1d",
-            auto_adjust=True,
+            auto_adjust=False,
             progress=False,
             threads=False
         )
@@ -54,7 +54,6 @@ for ticker in portfolio["TICKER"]:
             })
             continue
 
-        # Normaliza MultiIndex quando yfinance devolve colunas multinível.
         if isinstance(hist.columns, pd.MultiIndex):
             hist.columns = hist.columns.get_level_values(0)
 
@@ -85,7 +84,6 @@ for ticker in portfolio["TICKER"]:
 
         obs = int(last252["Close"].notna().sum())
 
-        # Liquidez observacional: mediana de preço × volume nos últimos 60 pregões.
         if "Volume" in last252.columns:
             turnover = (
                 pd.to_numeric(last252["Close"], errors="coerce")
@@ -130,8 +128,8 @@ for ticker in portfolio["TICKER"]:
             "TICKER": ticker,
             "LAST_DATE": last_date.date().isoformat(),
             "OBS_52W": obs,
-            "CURRENT_PRICE_ADJ": current_price,
-            "HIGH_52W_ADJ": high_52w,
+            "CURRENT_PRICE_RAW": current_price,
+            "HIGH_52W_RAW": high_52w,
             "DISCOUNT_ENGINE": original_discount,
             "DISCOUNT_RECALCULATED": discount_calc,
             "DISCOUNT_DIFF": diff,
@@ -170,8 +168,8 @@ print("=" * 78)
 
 cols = [
     "TICKER", "MACRO_SECTOR", "DISCOUNT_52W",
-    "DISCOUNT_RECALCULATED", "CURRENT_PRICE_ADJ",
-    "HIGH_52W_ADJ", "OBS_52W", "MEDIAN_TURNOVER_60D",
+    "DISCOUNT_RECALCULATED", "CURRENT_PRICE_RAW",
+    "HIGH_52W_RAW", "OBS_52W", "MEDIAN_TURNOVER_60D",
     "STATUS", "REASON"
 ]
 
@@ -187,6 +185,7 @@ print("=" * 78)
 print(f"Ações analisadas .................. {len(audit)}")
 print(f"PASS .............................. {n_pass}")
 print(f"REVIEW ............................ {n_review}")
+print("Preço base = Close bruto (PREULT) . PRESERVADO")
 print("Regra de seleção 80/20 ............ NÃO ALTERADA")
 print("Portfólio atual ................... NÃO ALTERADO")
 print("Histórico congelado ............... PRESERVADO")
