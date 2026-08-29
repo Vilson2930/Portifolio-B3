@@ -150,7 +150,8 @@ def merge_daily_price_history(
     - data/ permanece intocado;
     - chave única = DATE × TICKER;
     - em sobreposição, a coleta mais recente prevalece;
-    - nenhuma correção de evento corporativo é aplicada aqui.
+    - nenhuma correção de evento corporativo é aplicada aqui;
+    - retorna métricas explícitas para auditar persistência entre execuções.
     """
 
     required = [
@@ -167,7 +168,10 @@ def merge_daily_price_history(
 
     current = current_daily[required].copy()
 
-    if DAILY_PRICES_FILE.exists():
+    history_found = DAILY_PRICES_FILE.exists()
+    previous_rows_raw = 0
+
+    if history_found:
         previous = pd.read_csv(
             DAILY_PRICES_FILE,
             low_memory=False,
@@ -186,6 +190,7 @@ def merge_daily_price_history(
             )
 
         previous = previous[required].copy()
+        previous_rows_raw = len(previous)
 
         combined = pd.concat(
             [previous, current],
@@ -193,6 +198,8 @@ def merge_daily_price_history(
         )
     else:
         combined = current
+
+    current_rows_raw = len(current)
 
     combined["DATE"] = pd.to_datetime(
         combined["DATE"],
@@ -225,6 +232,8 @@ def merge_daily_price_history(
         & (combined["PREULT"] > 0)
     ].copy()
 
+    rows_before_dedup = len(combined)
+
     combined = (
         combined
         .drop_duplicates(
@@ -247,7 +256,16 @@ def merge_daily_price_history(
             f"{duplicated}"
         )
 
-    return combined
+    stats = {
+        "history_found": history_found,
+        "previous_rows_raw": int(previous_rows_raw),
+        "current_rows_raw": int(current_rows_raw),
+        "rows_before_dedup": int(rows_before_dedup),
+        "rows_after_merge": int(len(combined)),
+        "overlap_rows": int(rows_before_dedup - len(combined)),
+    }
+
+    return combined, stats
 
 
 def get_json(
@@ -1978,7 +1996,7 @@ def main():
     )
 
 
-    daily_history = merge_daily_price_history(
+    daily_history, persistence_stats = merge_daily_price_history(
         daily_current
     )
 
@@ -2036,6 +2054,47 @@ def main():
     )
 
     print()
+
+    print(
+        f"Histórico operacional encontrado ...... "
+        f"{'SIM' if persistence_stats['history_found'] else 'NÃO'}"
+    )
+
+    print(
+        f"Observações carregadas anteriormente ... "
+        f"{persistence_stats['previous_rows_raw']:,}"
+    )
+
+    print(
+        f"Observações da coleta atual ............ "
+        f"{persistence_stats['current_rows_raw']:,}"
+    )
+
+    print(
+        f"Sobreposições DATE x TICKER ............ "
+        f"{persistence_stats['overlap_rows']:,}"
+    )
+
+    print(
+        f"Observações após merge ................. "
+        f"{persistence_stats['rows_after_merge']:,}"
+    )
+
+    persistence_pass = (
+        (not persistence_stats["history_found"])
+        or persistence_stats["previous_rows_raw"] > 0
+    )
+
+    print(
+        "Persistência entre execuções ........... "
+        f"{'PASS' if persistence_pass else 'FAIL'}"
+    )
+
+    if not persistence_pass:
+        raise RuntimeError(
+            "Arquivo histórico operacional foi encontrado, "
+            "mas não continha observações."
+        )
 
     print(
         f"Observações diárias persistidas ....... "
