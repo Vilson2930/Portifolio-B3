@@ -3,6 +3,9 @@ name: Portfolio B3 - Reproducao do Estudo
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   reproduce-study:
     runs-on: ubuntu-latest
@@ -44,6 +47,20 @@ jobs:
 
       - name: Audit current B3 portfolio
         run: python audit_portfolio.py
+
+      - name: Persist operational daily price history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data_live/daily_prices_operational.csv
+
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteração no histórico operacional."
+          else
+            git commit -m "Update operational daily price history"
+            git push
+          fi
 
       - name: Upload historical reports
         if: always()
