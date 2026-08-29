@@ -37,7 +37,6 @@ repaired_rows = []
 
 def extract_series(hist, name):
     if isinstance(hist.columns, pd.MultiIndex):
-        # yfinance pode devolver MultiIndex mesmo para um ticker.
         level0 = hist.columns.get_level_values(0)
         if name not in level0:
             return pd.Series(dtype=float)
@@ -58,7 +57,7 @@ for i, row in base.iterrows():
             symbol,
             period="18mo",
             interval="1d",
-            auto_adjust=True,
+            auto_adjust=False,
             repair=True,
             progress=False,
             threads=False
@@ -151,7 +150,6 @@ audit = pd.DataFrame(audit_rows)
 
 out = base.merge(repair, on="TICKER", how="left", validate="one_to_one")
 
-# Substitui somente quando o Yahoo reparado devolveu valor válido.
 for original, repaired in [
     ("MOM_6M", "MOM_6M_REPAIRED"),
     ("MOM_12M", "MOM_12M_REPAIRED"),
@@ -172,7 +170,6 @@ if out["TICKER"].duplicated().any():
 if len(out) != len(base):
     raise RuntimeError("Quantidade de linhas mudou após reparo.")
 
-# O arquivo operacional é atualizado; data/ histórico permanece intocado.
 out.to_csv(PRICE_FILE, index=False)
 audit.to_csv(AUDIT_FILE, index=False)
 
@@ -191,6 +188,7 @@ print(f"Erros ............................. {errors}")
 print("MOM_6M = 126 pregões .............. PRESERVADO")
 print("MOM_12M = 252 pregões ............. PRESERVADO")
 print("DISCOUNT_52W ...................... PRESERVADO")
+print("Preço base = Close bruto (PREULT) . PRESERVADO")
 print("Classificação setorial ............ PRESERVADA")
 print("Histórico congelado ............... PRESERVADO")
 print()
