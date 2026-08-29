@@ -15,8 +15,12 @@ Regra congelada:
     - seleciona os 4 primeiros.
     - HISTORY_END < YEAR: sem look-ahead.
 
-Fonte atual (enquanto disponível no histórico congelado):
-    data/returns.csv
+Fontes:
+    data/returns.csv                  — histórico congelado
+    data_live/returns_operational.csv — continuidade operacional
+
+Os dois arquivos são combinados somente em memória.
+data/returns.csv nunca é alterado.
 
 Auditoria:
     Recalcula os rankings históricos LOOKBACK=1 e compara
@@ -48,7 +52,8 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DATA_LIVE = ROOT / "data_live"
 
-RETURNS_FILE = DATA / "returns.csv"
+HISTORICAL_RETURNS_FILE = DATA / "returns.csv"
+OPERATIONAL_RETURNS_FILE = DATA_LIVE / "returns_operational.csv"
 HISTORICAL_RANKINGS_FILE = DATA / "sector_rankings.csv"
 
 OUTPUT_RANKING_FILE = (
@@ -101,17 +106,10 @@ def normalize_sector(series: pd.Series) -> pd.Series:
 # 1. CARREGAMENTO DOS RETORNOS HISTÓRICOS CONGELADOS
 # =============================================================================
 
-def load_returns() -> pd.DataFrame:
-    if not RETURNS_FILE.exists():
-        raise RuntimeError(
-            f"Arquivo não encontrado: "
-            f"{RETURNS_FILE}"
-        )
-
-    df = pd.read_csv(
-        RETURNS_FILE,
-        low_memory=False,
-    )
+def _prepare_returns(
+    df: pd.DataFrame,
+    name: str,
+) -> pd.DataFrame:
 
     require_columns(
         df,
@@ -121,19 +119,19 @@ def load_returns() -> pd.DataFrame:
             "MACRO_SECTOR",
             "RET_ANNUAL_VALID",
         ],
-        "returns.csv",
+        name,
     )
+
+    df = df.copy()
 
     df["YEAR"] = pd.to_numeric(
         df["YEAR"],
         errors="coerce",
     )
 
-    df["RET_ANNUAL_VALID"] = (
-        pd.to_numeric(
-            df["RET_ANNUAL_VALID"],
-            errors="coerce",
-        )
+    df["RET_ANNUAL_VALID"] = pd.to_numeric(
+        df["RET_ANNUAL_VALID"],
+        errors="coerce",
     )
 
     df["TICKER"] = (
@@ -143,10 +141,8 @@ def load_returns() -> pd.DataFrame:
         .str.upper()
     )
 
-    df["MACRO_SECTOR"] = (
-        normalize_sector(
-            df["MACRO_SECTOR"]
-        )
+    df["MACRO_SECTOR"] = normalize_sector(
+        df["MACRO_SECTOR"]
     )
 
     df = df[
@@ -157,27 +153,116 @@ def load_returns() -> pd.DataFrame:
         & df["MACRO_SECTOR"].ne("UNCLASSIFIED")
     ].copy()
 
-    df["YEAR"] = (
-        df["YEAR"].astype(int)
-    )
+    df["YEAR"] = df["YEAR"].astype(int)
 
-    duplicated = (
+    duplicated = int(
         df.duplicated(
-            [
-                "YEAR",
-                "TICKER",
-            ]
-        )
-        .sum()
+            ["YEAR", "TICKER"]
+        ).sum()
     )
 
     if duplicated:
         raise RuntimeError(
-            "returns.csv possui duplicidades "
+            f"{name} possui duplicidades "
             f"YEAR × TICKER: {duplicated}"
         )
 
     return df
+
+
+def load_returns() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+
+    if not HISTORICAL_RETURNS_FILE.exists():
+        raise RuntimeError(
+            f"Arquivo histórico não encontrado: "
+            f"{HISTORICAL_RETURNS_FILE}"
+        )
+
+    historical_raw = pd.read_csv(
+        HISTORICAL_RETURNS_FILE,
+        low_memory=False,
+    )
+
+    historical = _prepare_returns(
+        historical_raw,
+        "data/returns.csv",
+    )
+
+    # O arquivo operacional é obrigatório a partir desta versão.
+    if not OPERATIONAL_RETURNS_FILE.exists():
+        raise RuntimeError(
+            "Arquivo operacional não encontrado: "
+            f"{OPERATIONAL_RETURNS_FILE}. "
+            "Execute update_returns.py antes de update_sectors.py."
+        )
+
+    operational_raw = pd.read_csv(
+        OPERATIONAL_RETURNS_FILE,
+        low_memory=False,
+    )
+
+    operational = _prepare_returns(
+        operational_raw,
+        "data_live/returns_operational.csv",
+    )
+
+    # Proteção estrutural: a camada operacional não pode sobrescrever
+    # nenhuma chave YEAR × TICKER já existente no histórico congelado.
+    historical_keys = set(
+        zip(
+            historical["YEAR"],
+            historical["TICKER"],
+        )
+    )
+
+    operational_keys = set(
+        zip(
+            operational["YEAR"],
+            operational["TICKER"],
+        )
+    )
+
+    overlap = historical_keys.intersection(
+        operational_keys
+    )
+
+    if overlap:
+        sample = sorted(overlap)[:10]
+        raise RuntimeError(
+            "Sobreposição entre histórico congelado e "
+            "retornos operacionais. Exemplos: "
+            f"{sample}"
+        )
+
+    combined = pd.concat(
+        [
+            historical,
+            operational,
+        ],
+        ignore_index=True,
+    )
+
+    combined = (
+        combined
+        .sort_values(
+            ["YEAR", "TICKER"]
+        )
+        .reset_index(drop=True)
+    )
+
+    duplicated = int(
+        combined.duplicated(
+            ["YEAR", "TICKER"]
+        ).sum()
+    )
+
+    if duplicated:
+        raise RuntimeError(
+            "Base combinada possui duplicidades "
+            f"YEAR × TICKER: {duplicated}"
+        )
+
+    return historical, operational, combined
 
 
 # =============================================================================
@@ -637,14 +722,27 @@ def main():
     )
     print("=" * 78)
 
-    returns = load_returns()
+    historical_returns, operational_returns, returns = load_returns()
 
     print()
     print(
         f"Retornos históricos : "
-        f"{int(returns['YEAR'].min())}–"
-        f"{int(returns['YEAR'].max())}"
+        f"{int(historical_returns['YEAR'].min())}–"
+        f"{int(historical_returns['YEAR'].max())}"
     )
+
+    if operational_returns.empty:
+        print(
+            "Retornos operacionais válidos : "
+            "0 (ano corrente ainda parcial)"
+        )
+    else:
+        print(
+            f"Retornos operacionais válidos : "
+            f"{len(operational_returns):,} "
+            f"({int(operational_returns['YEAR'].min())}–"
+            f"{int(operational_returns['YEAR'].max())})"
+        )
     print(
         f"Ano operacional     : "
         f"{CURRENT_YEAR}"
@@ -654,19 +752,26 @@ def main():
         f"{CURRENT_YEAR - 1}"
     )
 
-    sector_year = build_sector_year(
-        returns
+    # A auditoria histórica usa SOMENTE o histórico congelado.
+    # Assim, a camada operacional jamais pode alterar a prova
+    # de reprodução do FREEZE_TOP4_1Y.
+    historical_sector_year = build_sector_year(
+        historical_returns
     )
 
-    # A implementação operacional precisa primeiro provar
-    # que reproduz a regra congelada.
     audit_historical_rule(
-        sector_year
+        historical_sector_year
+    )
+
+    # O ranking corrente usa histórico + continuidade operacional
+    # combinados somente em memória.
+    combined_sector_year = build_sector_year(
+        returns
     )
 
     current_ranking = (
         build_ranking_for_year(
-            sector_year,
+            combined_sector_year,
             CURRENT_YEAR,
         )
     )
@@ -750,6 +855,12 @@ def main():
     )
     print(
         "Histórico congelado ............... PRESERVADO"
+    )
+    print(
+        "Retornos operacionais ............. INTEGRADOS EM MEMÓRIA"
+    )
+    print(
+        "Fonte ranking corrente ............ HISTÓRICO + OPERACIONAL"
     )
     print(
         "STATUS ............................ PASS"
