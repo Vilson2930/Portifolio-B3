@@ -9,6 +9,14 @@ PRIORIDADE DA CLASSIFICAÇÃO:
 4. UNCLASSIFIED se não houver evidência suficiente
 
 O histórico congelado em data/ NÃO é alterado.
+
+Saídas operacionais:
+    data_live/price_factors_current.csv
+    data_live/daily_prices_operational.csv
+
+A série diária é persistida com Close bruto (equivalente conceitual ao PREULT)
+e NÃO é filtrada pela proteção de comparabilidade dos fatores. O tratamento
+de retornos/eventos corporativos pertence à camada update_returns.py.
 """
 
 from __future__ import annotations
@@ -39,6 +47,11 @@ DATA_LIVE = ROOT / "data_live"
 OUTPUT_FILE = (
     DATA_LIVE
     / "price_factors_current.csv"
+)
+
+DAILY_PRICES_FILE = (
+    DATA_LIVE
+    / "daily_prices_operational.csv"
 )
 
 UNCLASSIFIED_FILE = (
@@ -125,6 +138,116 @@ def normalize_text(value):
     )
 
     return text
+
+
+def merge_daily_price_history(
+    current_daily,
+):
+    """
+    Une a janela diária recém-baixada ao histórico operacional já existente.
+
+    Regras:
+    - data/ permanece intocado;
+    - chave única = DATE × TICKER;
+    - em sobreposição, a coleta mais recente prevalece;
+    - nenhuma correção de evento corporativo é aplicada aqui.
+    """
+
+    required = [
+        "DATE",
+        "TICKER",
+        "MACRO_SECTOR",
+        "PREULT",
+    ]
+
+    if current_daily.empty:
+        raise RuntimeError(
+            "Série diária operacional atual vazia."
+        )
+
+    current = current_daily[required].copy()
+
+    if DAILY_PRICES_FILE.exists():
+        previous = pd.read_csv(
+            DAILY_PRICES_FILE,
+            low_memory=False,
+        )
+
+        missing = [
+            col
+            for col in required
+            if col not in previous.columns
+        ]
+
+        if missing:
+            raise RuntimeError(
+                "daily_prices_operational.csv sem colunas obrigatórias: "
+                f"{missing}"
+            )
+
+        previous = previous[required].copy()
+
+        combined = pd.concat(
+            [previous, current],
+            ignore_index=True,
+        )
+    else:
+        combined = current
+
+    combined["DATE"] = pd.to_datetime(
+        combined["DATE"],
+        errors="coerce",
+    )
+
+    combined["TICKER"] = (
+        combined["TICKER"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    combined["MACRO_SECTOR"] = (
+        combined["MACRO_SECTOR"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    combined["PREULT"] = pd.to_numeric(
+        combined["PREULT"],
+        errors="coerce",
+    )
+
+    combined = combined[
+        combined["DATE"].notna()
+        & combined["TICKER"].ne("")
+        & combined["PREULT"].notna()
+        & (combined["PREULT"] > 0)
+    ].copy()
+
+    combined = (
+        combined
+        .drop_duplicates(
+            ["DATE", "TICKER"],
+            keep="last",
+        )
+        .sort_values(
+            ["TICKER", "DATE"]
+        )
+        .reset_index(drop=True)
+    )
+
+    duplicated = combined.duplicated(
+        ["DATE", "TICKER"]
+    ).sum()
+
+    if duplicated:
+        raise RuntimeError(
+            "Duplicidades DATE × TICKER na série diária operacional: "
+            f"{duplicated}"
+        )
+
+    return combined
 
 
 def get_json(
@@ -1283,6 +1406,7 @@ def build_current_price_factors(
 
 
     rows = []
+    daily_rows = []
 
 
     tickers = (
@@ -1390,6 +1514,45 @@ def build_current_price_factors(
             meta = metadata[
                 ticker
             ]
+
+            # -----------------------------------------------------------------
+            # Persistência da série diária BRUTA.
+            #
+            # Não aplica a proteção de comparabilidade usada nos fatores.
+            # A camada de retornos será responsável por reproduzir a regra
+            # histórica de RET_RAW / RET_CLEAN / RET_ANNUAL_VALID.
+            # -----------------------------------------------------------------
+            for date, price in series.items():
+
+                price_value = safe_float(
+                    price
+                )
+
+                if (
+                    pd.isna(price_value)
+                    or price_value <= 0
+                ):
+                    continue
+
+                daily_rows.append(
+                    {
+                        "DATE":
+                            pd.Timestamp(date)
+                            .date()
+                            .isoformat(),
+
+                        "TICKER":
+                            ticker,
+
+                        "MACRO_SECTOR":
+                            meta[
+                                "MACRO_SECTOR"
+                            ],
+
+                        "PREULT":
+                            price_value,
+                    }
+                )
 
             comparability_break = has_price_comparability_break(
                 series.tail(TRADING_DAYS_12M + 1)
@@ -1521,7 +1684,56 @@ def build_current_price_factors(
     )
 
 
-    return factors
+    daily_current = pd.DataFrame(
+        daily_rows
+    )
+
+
+    if daily_current.empty:
+
+        raise RuntimeError(
+            "Nenhuma observação diária foi coletada."
+        )
+
+
+    daily_current["DATE"] = pd.to_datetime(
+        daily_current["DATE"],
+        errors="coerce",
+    )
+
+
+    daily_current = (
+
+        daily_current
+
+        [
+            daily_current["DATE"].notna()
+            & daily_current["PREULT"].notna()
+            & (daily_current["PREULT"] > 0)
+        ]
+
+        .drop_duplicates(
+            [
+                "DATE",
+                "TICKER",
+            ],
+            keep="last",
+        )
+
+        .sort_values(
+            [
+                "TICKER",
+                "DATE",
+            ]
+        )
+
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+    return factors, daily_current
 
 
 # =============================================================================
@@ -1748,7 +1960,7 @@ def main():
     )
 
 
-    factors = (
+    factors, daily_current = (
         build_current_price_factors(
             universe
         )
@@ -1763,6 +1975,19 @@ def main():
     DATA_LIVE.mkdir(
         parents=True,
         exist_ok=True,
+    )
+
+
+    daily_history = merge_daily_price_history(
+        daily_current
+    )
+
+
+    daily_history.to_csv(
+        DAILY_PRICES_FILE,
+        index=False,
+        encoding="utf-8-sig",
+        date_format="%Y-%m-%d",
     )
 
 
@@ -1796,7 +2021,7 @@ def main():
     print("=" * 78)
 
     print(
-        "ARQUIVO GERADO"
+        "ARQUIVOS GERADOS"
     )
 
     print("=" * 78)
@@ -1804,6 +2029,31 @@ def main():
 
     print(
         OUTPUT_FILE
+    )
+
+    print(
+        DAILY_PRICES_FILE
+    )
+
+    print()
+
+    print(
+        f"Observações diárias persistidas ....... "
+        f"{len(daily_history):,}"
+    )
+
+    print(
+        f"Período diário persistido ............. "
+        f"{daily_history['DATE'].min().date()} a "
+        f"{daily_history['DATE'].max().date()}"
+    )
+
+    print(
+        "Série diária = Close bruto (PREULT) .... PASS"
+    )
+
+    print(
+        "Tratamento RET_CLEAN nesta camada ...... NÃO"
     )
 
 
