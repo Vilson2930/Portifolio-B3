@@ -61,6 +61,11 @@ TRADING_DAYS_12M = 252
 
 MIN_OBS_DISCOUNT = 60
 
+# Proteção de comparabilidade da série.
+# Saltos de preço de 10x ou mais entre pregões consecutivos são tratados
+# como quebra mecânica/corporativa da série, não como retorno econômico.
+MAX_CONSECUTIVE_PRICE_RATIO = 10.0
+
 MIN_SECTOR_COVERAGE = 0.95
 
 
@@ -1178,6 +1183,38 @@ def price_return(
     )
 
 
+def has_price_comparability_break(series):
+    """
+    Detecta quebra extrema de comparabilidade entre fechamentos consecutivos.
+
+    Não corrige nem inventa preços. Apenas impede que uma série com ruptura
+    mecânica/corporativa alimente MOM_6M, MOM_12M e DISCOUNT_52W.
+    """
+    if series is None or len(series) < 2:
+        return False
+
+    s = pd.to_numeric(series, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    ).dropna()
+
+    s = s[s > 0]
+
+    if len(s) < 2:
+        return False
+
+    ratios = s / s.shift(1)
+    ratios = ratios.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if ratios.empty:
+        return False
+
+    return bool(
+        (ratios >= MAX_CONSECUTIVE_PRICE_RATIO).any()
+        or
+        (ratios <= (1.0 / MAX_CONSECUTIVE_PRICE_RATIO)).any()
+    )
+
+
 def discount_52w(
     series,
 ):
@@ -1354,6 +1391,29 @@ def build_current_price_factors(
                 ticker
             ]
 
+            comparability_break = has_price_comparability_break(
+                series.tail(TRADING_DAYS_12M + 1)
+            )
+
+            if comparability_break:
+                mom_6m = np.nan
+                mom_12m = np.nan
+                discount = np.nan
+                price_quality_status = "CORPORATE_ACTION_REVIEW"
+            else:
+                mom_6m = price_return(
+                    series,
+                    TRADING_DAYS_6M,
+                )
+                mom_12m = price_return(
+                    series,
+                    TRADING_DAYS_12M,
+                )
+                discount = discount_52w(
+                    series
+                )
+                price_quality_status = "PASS"
+
 
             rows.append(
                 {
@@ -1384,21 +1444,16 @@ def build_current_price_factors(
                         ],
 
                     "MOM_6M":
-                        price_return(
-                            series,
-                            TRADING_DAYS_6M,
-                        ),
+                        mom_6m,
 
                     "MOM_12M":
-                        price_return(
-                            series,
-                            TRADING_DAYS_12M,
-                        ),
+                        mom_12m,
 
                     "DISCOUNT_52W":
-                        discount_52w(
-                            series
-                        ),
+                        discount,
+
+                    "PRICE_QUALITY_STATUS":
+                        price_quality_status,
 
                     "LAST_PRICE":
                         safe_float(
@@ -1640,6 +1695,17 @@ def audit(
     print(
         "Preço base = Close bruto (PREULT)  PASS"
     )
+
+    if "PRICE_QUALITY_STATUS" in factors.columns:
+        n_review = int(
+            (factors["PRICE_QUALITY_STATUS"] != "PASS").sum()
+        )
+        print(
+            f"Quebras de comparabilidade ........ {n_review}"
+        )
+        print(
+            "Proteção evento corporativo ....... ATIVA"
+        )
 
 
     print(
