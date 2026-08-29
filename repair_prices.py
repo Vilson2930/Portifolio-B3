@@ -11,6 +11,7 @@ PRICE_FILE = DATA_LIVE / "price_factors_current.csv"
 AUDIT_FILE = DATA_LIVE / "price_repair_audit.csv"
 
 MIN_OBS_DISCOUNT = 60
+MAX_CONSECUTIVE_PRICE_RATIO = 10.0
 
 print("=" * 78)
 print("PORTIFOLIO-B3 — REPARO DE PREÇOS OPERACIONAIS")
@@ -48,9 +49,53 @@ def extract_series(hist, name):
         return pd.Series(dtype=float)
     return pd.to_numeric(hist[name], errors="coerce")
 
+def has_price_comparability_break(series):
+    s = pd.to_numeric(series, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    ).dropna()
+    s = s[s > 0]
+
+    if len(s) < 2:
+        return False
+
+    ratios = (s / s.shift(1)).replace(
+        [np.inf, -np.inf], np.nan
+    ).dropna()
+
+    if ratios.empty:
+        return False
+
+    return bool(
+        (ratios >= MAX_CONSECUTIVE_PRICE_RATIO).any()
+        or
+        (ratios <= (1.0 / MAX_CONSECUTIVE_PRICE_RATIO)).any()
+    )
+
 for i, row in base.iterrows():
     ticker = row["TICKER"]
     symbol = f"{ticker}.SA"
+
+    # Se a camada principal já detectou quebra de comparabilidade,
+    # o reparo NÃO pode recolocar os fatores.
+    base_quality = str(
+        row.get("PRICE_QUALITY_STATUS", "PASS")
+    ).strip().upper()
+
+    if base_quality == "CORPORATE_ACTION_REVIEW":
+        repaired_rows.append({
+            "TICKER": ticker,
+            "MOM_6M_REPAIRED": np.nan,
+            "MOM_12M_REPAIRED": np.nan,
+            "DISCOUNT_52W_REPAIRED": np.nan
+        })
+        audit_rows.append({
+            "TICKER": ticker,
+            "STATUS": "CORPORATE_ACTION_REVIEW",
+            "OLD_DISCOUNT_52W": row["DISCOUNT_52W"],
+            "NEW_DISCOUNT_52W": np.nan,
+            "ABS_DIFF": np.nan
+        })
+        continue
 
     try:
         hist = yf.download(
@@ -75,6 +120,23 @@ for i, row in base.iterrows():
             audit_rows.append({
                 "TICKER": ticker,
                 "STATUS": "NO_DATA",
+                "OLD_DISCOUNT_52W": row["DISCOUNT_52W"],
+                "NEW_DISCOUNT_52W": np.nan,
+                "ABS_DIFF": np.nan
+            })
+            continue
+
+        # Segunda barreira: o próprio download reparado também é testado.
+        if has_price_comparability_break(close.tail(253)):
+            repaired_rows.append({
+                "TICKER": ticker,
+                "MOM_6M_REPAIRED": np.nan,
+                "MOM_12M_REPAIRED": np.nan,
+                "DISCOUNT_52W_REPAIRED": np.nan
+            })
+            audit_rows.append({
+                "TICKER": ticker,
+                "STATUS": "CORPORATE_ACTION_REVIEW",
                 "OLD_DISCOUNT_52W": row["DISCOUNT_52W"],
                 "NEW_DISCOUNT_52W": np.nan,
                 "ABS_DIFF": np.nan
@@ -176,6 +238,7 @@ audit.to_csv(AUDIT_FILE, index=False)
 changed = int((audit["ABS_DIFF"] > 0.02).fillna(False).sum())
 no_data = int((audit["STATUS"] == "NO_DATA").sum())
 errors = int(audit["STATUS"].astype(str).str.startswith("ERROR").sum())
+corp_review = int((audit["STATUS"] == "CORPORATE_ACTION_REVIEW").sum())
 
 print()
 print("=" * 78)
@@ -183,12 +246,14 @@ print("AUDITORIA")
 print("=" * 78)
 print(f"Tickers processados ............... {len(base)}")
 print(f"Alterações relevantes (>2 p.p.) ... {changed}")
+print(f"Quebra comparabilidade ............ {corp_review}")
 print(f"Sem dados reparados ............... {no_data}")
 print(f"Erros ............................. {errors}")
 print("MOM_6M = 126 pregões .............. PRESERVADO")
 print("MOM_12M = 252 pregões ............. PRESERVADO")
 print("DISCOUNT_52W ...................... PRESERVADO")
 print("Preço base = Close bruto (PREULT) . PRESERVADO")
+print("Proteção evento corporativo ....... ATIVA")
 print("Classificação setorial ............ PRESERVADA")
 print("Histórico congelado ............... PRESERVADO")
 print()
