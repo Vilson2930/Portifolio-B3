@@ -50,6 +50,19 @@ fund["TICKER"] = fund["TICKER"].astype(str).str.upper().str.strip()
 price["MACRO_SECTOR"] = price["MACRO_SECTOR"].astype(str).str.upper().str.strip()
 selected_sectors["MACRO_SECTOR"] = selected_sectors["MACRO_SECTOR"].astype(str).str.upper().str.strip()
 
+# Compatibilidade com a nova proteção de preços.
+# Arquivos antigos, sem a coluna, continuam funcionando como PASS.
+if "PRICE_QUALITY_STATUS" not in price.columns:
+    price["PRICE_QUALITY_STATUS"] = "PASS"
+
+price["PRICE_QUALITY_STATUS"] = (
+    price["PRICE_QUALITY_STATUS"]
+    .fillna("PASS")
+    .astype(str)
+    .str.upper()
+    .str.strip()
+)
+
 top4 = selected_sectors["MACRO_SECTOR"].dropna().drop_duplicates().tolist()
 if len(top4) != 4:
     raise RuntimeError(f"Esperados 4 setores; encontrados {len(top4)}.")
@@ -64,7 +77,9 @@ fund_cols = [
     "NET_MARGIN_W", "DEBT_TO_EQUITY_PROXY_W", "EQUITY"
 ]
 
-merged = price[["TICKER", "MACRO_SECTOR", "DISCOUNT_52W"]].merge(
+merged = price[
+    ["TICKER", "MACRO_SECTOR", "DISCOUNT_52W", "PRICE_QUALITY_STATUS"]
+].merge(
     fund[fund_cols],
     on="TICKER",
     how="left",
@@ -80,9 +95,22 @@ num_cols = [
 for c in num_cols:
     merged[c] = pd.to_numeric(merged[c], errors="coerce")
 
-# 1) Discount Score — maior desconto = melhor
-merged["DISCOUNT_SCORE"] = (
-    merged.groupby("MACRO_SECTOR")["DISCOUNT_52W"]
+# Séries com quebra de comparabilidade não entram na seleção.
+merged["PRICE_QUALITY_OK"] = (
+    merged["PRICE_QUALITY_STATUS"].eq("PASS")
+)
+
+# 1) Discount Score — maior desconto = melhor.
+# O ranking é calculado somente entre séries comparáveis.
+merged["DISCOUNT_SCORE"] = np.nan
+quality_mask = (
+    merged["PRICE_QUALITY_OK"]
+    & merged["DISCOUNT_52W"].notna()
+)
+
+merged.loc[quality_mask, "DISCOUNT_SCORE"] = (
+    merged.loc[quality_mask]
+    .groupby("MACRO_SECTOR")["DISCOUNT_52W"]
     .rank(method="average", pct=True, ascending=True)
 )
 
@@ -120,12 +148,32 @@ merged["FINAL_SCORE"] = (
 )
 
 merged["ELIGIBLE"] = (
-    merged["DISCOUNT_SCORE"].notna()
+    merged["PRICE_QUALITY_OK"]
+    & merged["DISCOUNT_SCORE"].notna()
     & merged["FUND_SCORE"].notna()
     & merged["FINAL_SCORE"].notna()
 )
 
 eligible = merged[merged["ELIGIBLE"]].copy()
+
+# Garante que cada TOP4 possua pelo menos 3 ações válidas após o filtro de qualidade.
+eligible_counts = (
+    eligible.groupby("MACRO_SECTOR")["TICKER"]
+    .nunique()
+    .to_dict()
+)
+
+insufficient = {
+    s: eligible_counts.get(s, 0)
+    for s in top4
+    if eligible_counts.get(s, 0) < TOP_N_PER_SECTOR
+}
+
+if insufficient:
+    raise RuntimeError(
+        "Setor(es) sem 3 ações elegíveis após controle de qualidade de preços: "
+        f"{insufficient}"
+    )
 
 eligible = eligible.sort_values(
     ["MACRO_SECTOR", "FINAL_SCORE", "DISCOUNT_SCORE", "FUND_SCORE", "TICKER"],
@@ -154,12 +202,14 @@ duplicates = int(portfolio["TICKER"].duplicated().sum())
 n_portfolio = int(portfolio["TICKER"].nunique())
 
 three_per_sector = all(sector_counts.get(s, 0) == 3 for s in top4)
+quality_fail_selected = int((~portfolio["PRICE_QUALITY_OK"]).sum())
 
 audit_pass = (
     len(top4) == 4
     and three_per_sector
     and duplicates == 0
     and n_portfolio == EXPECTED_PORTFOLIO_SIZE
+    and quality_fail_selected == 0
 )
 
 print("\n" + "=" * 78)
@@ -169,7 +219,8 @@ print("=" * 78)
 view = portfolio[
     [
         "TOP4_RANK", "MACRO_SECTOR", "SECTOR_RANK", "TICKER",
-        "DISCOUNT_52W", "DISCOUNT_SCORE", "FUND_SCORE", "FINAL_SCORE"
+        "DISCOUNT_52W", "DISCOUNT_SCORE", "FUND_SCORE", "FINAL_SCORE",
+        "PRICE_QUALITY_STATUS"
     ]
 ].copy()
 
@@ -178,6 +229,20 @@ for c in ["DISCOUNT_52W", "DISCOUNT_SCORE", "FUND_SCORE", "FINAL_SCORE"]:
 
 print(view.to_string(index=False))
 
+excluded_quality = merged[
+    ~merged["PRICE_QUALITY_OK"]
+][["TICKER", "MACRO_SECTOR", "PRICE_QUALITY_STATUS"]].copy()
+
+print("\n" + "=" * 78)
+print("CONTROLE DE QUALIDADE DE PREÇOS")
+print("=" * 78)
+print(f"Ações bloqueadas por comparabilidade . {len(excluded_quality)}")
+print(f"Ações bloqueadas dentro do portfólio . {quality_fail_selected}")
+
+if not excluded_quality.empty:
+    print()
+    print(excluded_quality.to_string(index=False))
+
 print("\n" + "=" * 78)
 print("AUDITORIA FINAL")
 print("=" * 78)
@@ -185,15 +250,18 @@ print("Arquitetura ....................... 4 setores × 3 ações")
 print(f"Setores selecionados .............. {len(top4)}")
 print(f"Ações selecionadas ................ {n_portfolio}")
 print(f"Duplicidades ...................... {duplicates}")
+print(f"Qualidade de preço inválida ....... {quality_fail_selected}")
 print("Regra ............................. DISCOUNT_80_FUNDAMENTALS_20")
 print("Peso desconto ..................... 80%")
 print("Peso fundamentos .................. 20%")
 print("Fund Score mínimo ................. 3 componentes")
+print("Proteção evento corporativo ....... ATIVA")
 print("Histórico congelado ............... PRESERVADO")
 print(f"STATUS ............................ {'PASS' if audit_pass else 'FAIL'}")
 
 score_cols_out = [
-    "TICKER", "MACRO_SECTOR", "DISCOUNT_52W", "DISCOUNT_SCORE",
+    "TICKER", "MACRO_SECTOR", "PRICE_QUALITY_STATUS", "PRICE_QUALITY_OK",
+    "DISCOUNT_52W", "DISCOUNT_SCORE",
     "ROE_W", "ROA_W", "OPERATING_MARGIN_W", "NET_MARGIN_W",
     "DEBT_TO_EQUITY_PROXY_W", "EQUITY",
     "FUND_COMPONENTS_VALID", "FUND_SCORE", "FINAL_SCORE", "ELIGIBLE"
@@ -206,6 +274,7 @@ merged[score_cols_out].sort_values(
 
 portfolio_cols = [
     "TOP4_RANK", "MACRO_SECTOR", "SECTOR_RANK", "TICKER",
+    "PRICE_QUALITY_STATUS",
     "DISCOUNT_52W", "DISCOUNT_SCORE",
     "FUND_COMPONENTS_VALID", "FUND_SCORE", "FINAL_SCORE"
 ]
@@ -217,6 +286,7 @@ audit = pd.DataFrame([
     {"CHECK": "PORTFOLIO_SIZE", "VALUE": n_portfolio, "EXPECTED": 12, "STATUS": "PASS" if n_portfolio == 12 else "FAIL"},
     {"CHECK": "DUPLICATES", "VALUE": duplicates, "EXPECTED": 0, "STATUS": "PASS" if duplicates == 0 else "FAIL"},
     {"CHECK": "THREE_PER_SECTOR", "VALUE": str(sector_counts), "EXPECTED": "3 por setor", "STATUS": "PASS" if three_per_sector else "FAIL"},
+    {"CHECK": "PRICE_QUALITY", "VALUE": quality_fail_selected, "EXPECTED": 0, "STATUS": "PASS" if quality_fail_selected == 0 else "FAIL"},
     {"CHECK": "RULE", "VALUE": "DISCOUNT_80_FUNDAMENTALS_20", "EXPECTED": "DISCOUNT_80_FUNDAMENTALS_20", "STATUS": "PASS"},
     {"CHECK": "HISTORICAL_CORE", "VALUE": "PRESERVED", "EXPECTED": "PRESERVED", "STATUS": "PASS"},
 ])
@@ -232,7 +302,8 @@ print(f"Auditoria : {OUT_AUDIT}")
 if not audit_pass:
     raise RuntimeError(
         f"AUDITORIA FINAL = FAIL | portfolio={n_portfolio}, "
-        f"duplicidades={duplicates}, contagem_setores={sector_counts}"
+        f"duplicidades={duplicates}, qualidade_preco={quality_fail_selected}, "
+        f"contagem_setores={sector_counts}"
     )
 
 print("\nSTATUS: PORTFÓLIO OPERACIONAL 4x3 VALIDADO")
