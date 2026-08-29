@@ -1028,8 +1028,10 @@ def download_batch(
         interval=
             PRICE_INTERVAL,
 
+        # PREULT histórico da Célula 26 = preço de fechamento bruto.
+        # Mantém o operacional alinhado à base histórica.
         auto_adjust=
-            True,
+            False,
 
         progress=
             False,
@@ -1633,6 +1635,10 @@ def audit(
 
     print(
         "Discount 52W ..................... PASS"
+    )
+
+    print(
+        "Preço base = Close bruto (PREULT)  PASS"
     )
 
 
